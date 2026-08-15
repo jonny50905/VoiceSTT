@@ -133,6 +133,8 @@ class Track:
         self.la_last = ""  # 上次取樣的完整假設
         self.la_commit = ""  # 已提交前綴
         self.la_t = 0.0  # 上次取樣時間
+        self.last_loud = 0.0  # 此軌最近一次有聲音的時間(雙音源仲裁用)
+        self.recent_finals = []  # [(start_epoch, line)] 近幾句定稿(跨軌 bleed 比對用)
         self.total = 0  # 累計餵入樣本數(含 keepalive 靜音)
         self.buf = []  # 滾動 PCM 緩衝(mono int16 陣列串),供 2-pass 回切句音訊
         self.buf_start = 0  # buf[0] 開頭對應的樣本位移
@@ -175,6 +177,8 @@ class Track:
             self.last_data = time.time()
 
     def _ingest(self, pcm):
+        if pcm.size and float(np.abs(pcm.astype(np.int32)).mean()) > 80:
+            self.last_loud = time.time()
         self.wav.writeframes(pcm.tobytes())
         self.stream_s.accept_waveform(self.sr, pcm.astype(np.float32) / 32768.0)
         self.total += len(pcm)
@@ -348,8 +352,10 @@ def main():
     jsonl = open(session / "subtitles.jsonl", "a", encoding="utf-8")
     partial_shown = ""
     seq = 0
+    records = []  # 收尾時依 audio_start 排序輸出(兩軌同時完成會寫入倒置)
 
     FILLER_CHARS = set("呃嗯啊哦欸喔嘿哎唉就然後這些那個")
+    lb_tr = next((t for t in tracks if t.name == "loopback"), None)
 
     def emit(tr, text):
         nonlocal partial_shown, seq
@@ -361,28 +367,50 @@ def main():
         # 純贅詞碎片(呃/嗯/,然後…)不上畫面、不進 2-pass,只留紀錄
         core = "".join(ch for ch in line if ch.isalnum())
         filler = len(core) <= 6 and all(ch in FILLER_CHARS for ch in core)
-        if not filler:
+        # 跨軌去重:喇叭聲被 mic 收到(實測落後 ~0.14s)→ 兩軌認出同一段話,mic 版標 bleed 丟棄
+        bleed = False
+        if tr.name == "mic" and lb_tr is not None and not filler:
+            import difflib
+            nrm = lambda s: "".join(ch for ch in s if ch.isalnum()).lower()
+            a = nrm(line)
+            cands = [to_display(rec.get_result(lb_tr.stream_s))]
+            cands += [t2 for (s0, t2) in lb_tr.recent_finals
+                      if s0 >= (tr.utt_start or 0) - 10]
+            for c in cands:
+                b = nrm(c)
+                if a and b and (difflib.SequenceMatcher(None, a, b).ratio() >= 0.55
+                                or (len(a) >= 10 and (a in b or b in a))):
+                    bleed = True
+                    break
+        tr.recent_finals.append((tr.utt_start or time.time(), line))
+        del tr.recent_finals[:-6]
+        if not filler and not bleed:
             ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": stable})
-        rlog({"ev": "final", "utt": tr.utt_id, "seq": seq,
+        rlog({"ev": "final", "utt": tr.utt_id, "seq": seq, "track": tr.name,
               "audio_start": round((tr.utt_start_sample or 0) / tr.sr, 2),
               "audio_end": round(tr.total / tr.sr, 2),
-              "dropped": "filler" if filler else None,
+              "dropped": "filler" if filler else ("bleed" if bleed else None),
               "revised_vs_shown": stable != line})
         ts = dt.datetime.fromtimestamp(tr.utt_start or time.time())
         sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
         partial_shown = ""
-        print(f"[{ts:%H:%M:%S}][{tr.label}]{'(贅詞略)' if filler else ''} {line}", flush=True)
-        rec_line = {"t": ts.isoformat(timespec="seconds"), "track": tr.name,
-                    "label": tr.label, "text": line}
+        tag = "(贅詞略)" if filler else ("(回授略)" if bleed else "")
+        print(f"[{ts:%H:%M:%S}][{tr.label}]{tag} {line}", flush=True)
+        rec_line = {"t": ts.isoformat(timespec="seconds"),
+                    "start": round(tr.utt_start or time.time(), 2),
+                    "track": tr.name, "label": tr.label, "text": line}
         if line != raw:
             rec_line["raw"] = raw
         if filler:
             rec_line["filler"] = True
+        if bleed:
+            rec_line["bleed"] = True
         if stable != line:
             rec_line["shown"] = stable
         jsonl.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
         jsonl.flush()
-        if refine_dir is not None and tr.utt_start_sample is not None and not filler:
+        records.append(rec_line)
+        if refine_dir is not None and tr.utt_start_sample is not None and not filler and not bleed:
             clip = tr.slice_from(tr.utt_start_sample - int(1.5 * tr.sr))  # 前補 1.5s 防切頭
             qw = wave.open(str(refine_dir / f"{seq:06d}.wav"), "wb")
             qw.setnchannels(1)
@@ -396,6 +424,7 @@ def main():
                 ensure_ascii=False), encoding="utf-8")
 
     ov_live_sent = [None]
+    display_owner = [None]
     utt_counter = [0]
     t0 = time.time()
     try:
@@ -429,12 +458,21 @@ def main():
                 sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
                 partial_shown = ""
                 print(ln, flush=True)
-            # 部分結果顯示:取最近開口的那軌,經 LocalAgreement 穩定化後上畫面
+            # 顯示仲裁:①喇叭出聲期間 mic 多半是回授,不得搶畫面;
+            # ②一句講完前畫面不換軌(所有權),另一軌內容等定稿再以 final 併入
             talking = [tr for tr in tracks if rec.get_result(tr.stream_s)]
+            now = time.time()
+            cands = [t2 for t2 in talking
+                     if not (t2.name == "mic" and lb_tr is not None
+                             and now - lb_tr.last_loud < 0.7)]
+            owner = display_owner[0]
+            if owner not in cands or owner.utt_id is None:
+                owner = min(cands, key=lambda t2: t2.utt_start or now) if cands else None
+                display_owner[0] = owner
             show = ""
             disp = ""
-            if talking:
-                tr = max(talking, key=lambda t: t.utt_start or 0)
+            if owner is not None:
+                tr = owner
                 full = to_display(rec.get_result(tr.stream_s))
                 now = time.time()
                 if now - tr.la_t >= 0.4:  # 取樣節奏:兩輪一致的前綴才提交
@@ -500,6 +538,10 @@ def main():
                 overlay_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 overlay_proc.terminate()
+        # 依 audio_start 排序的整併版(兩軌同時完成時 subtitles.jsonl 是寫入序,會倒置)
+        with open(session / "subtitles_sorted.jsonl", "w", encoding="utf-8") as sf:
+            for r in sorted(records, key=lambda r: r.get("start", 0)):
+                sf.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"\n--- 結束,產物在 {session} ---")
         for tr in tracks:
             tr.close()

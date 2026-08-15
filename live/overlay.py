@@ -96,19 +96,36 @@ class Overlay:
     # --- 排版核心 ---
 
     def _append(self, delta):
-        """把新提交的文字接到進行中行;過長時沿語句邊界整行捲動(捲出的行不再重排)。"""
+        """把新提交的文字接到進行中行;過長時整行捲動(捲出的行不再重排)。
+        斷行優先序:標點 > 空白;硬切不落在英文 token 中間;標點與語尾助詞不置行首。"""
         self.cur += delta
         while _w(self.cur) + _w(self.tail) > LINE_CHARS and _w(self.cur) > 4:
             cut = None
+            last_sp = None
+            hard = len(self.cur)
             acc = 0.0
             for i, ch in enumerate(self.cur):
                 acc += 1 if ord(ch) > 0x2E80 else 0.5
                 if acc > LINE_CHARS:
+                    hard = i
                     break
                 if ch in BREAKS:
                     cut = i + 1
-            if cut is None or _w(self.cur[:cut]) < 6:  # 無語句邊界就硬切滿行
-                cut = max(1, i)
+                elif ch == " ":
+                    last_sp = i + 1
+            if cut is None or _w(self.cur[:cut]) < 6:
+                cut = last_sp if (last_sp and _w(self.cur[:last_sp]) >= 6) else max(1, hard)
+                # 硬切不拆英文 token:落在字母/數字中間就退到 token 開頭
+                while (0 < cut < len(self.cur)
+                       and self.cur[cut - 1].isascii() and self.cur[cut - 1].isalnum()
+                       and self.cur[cut].isascii() and self.cur[cut].isalnum()):
+                    cut -= 1
+                if cut <= 1:  # 整行一個超長 token,只能硬切
+                    cut = max(1, hard)
+            # 標點與語尾助詞不置行首:拉到上一行行尾
+            while cut < len(self.cur) and (self.cur[cut] in BREAKS
+                                           or self.cur[cut] in "的了嗎呢吧啊嘛哦喔耶"):
+                cut += 1
             self.prev = self.cur[:cut].strip()
             self.cur = self.cur[cut:].lstrip()
 
