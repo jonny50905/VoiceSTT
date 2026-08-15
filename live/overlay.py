@@ -153,8 +153,14 @@ class Overlay:
                 elif ev.get("utt") != self.cur_utt:
                     self._append(t)
                 self.tail = ""
+                if self.cur.strip():  # 句子完成即換行:跨句/跨軌內容不會黏在同一行
+                    self.prev = self.cur.strip()
+                    self.cur = ""
                 self.cur_utt = None
                 self.consumed = 0
+                self.last_update = time.time()
+            elif kind == "busy":
+                # 有句子還在錄音/辨識中:重置停留倒數,活動中禁止清屏
                 self.last_update = time.time()
             elif kind == "eof":
                 # 收尾:最後一句至少停留 1.5s 再消失

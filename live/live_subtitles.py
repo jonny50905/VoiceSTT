@@ -270,11 +270,16 @@ def main():
     import re as _re
     _letters = _re.compile(r"\b(?:[A-Za-z]\s)+[A-Za-z]\b")  # 單字母序列:V I P→VIP、L A→LA
     _decimal = _re.compile(r"(\d)\s*\.\s*(\d)")  # 0 . 5→0.5
+    # 中文小數(一點二→1.2):窄模式,前後不接其他數量詞才轉,避免誤傷「有一點難」
+    _zhnum = "零一二三四五六七八九"
+    _zhdec = _re.compile(rf"(?<![{_zhnum}十百千])([{_zhnum}])點([{_zhnum}]{{1,4}})(?![{_zhnum}十百千萬分])")
 
     def to_display(text):
         t = s2twp.convert(text)
         t = _letters.sub(lambda m: m.group(0).replace(" ", ""), t)
         t = _decimal.sub(r"\1.\2", t)
+        t = _zhdec.sub(lambda m: f"{_zhnum.index(m.group(1))}."
+                       + "".join(str(_zhnum.index(c)) for c in m.group(2)), t)
         return apply_terms(t, terms)
 
     tracks = []
@@ -362,8 +367,14 @@ def main():
         seq += 1
         raw = s2twp.convert(text.strip())
         line = to_display(text.strip())
-        # 顯示版不回改:已提交前綴優先,定稿只能在其後延伸
-        stable = line if line.startswith(tr.la_commit) else (tr.la_commit or line)
+        # final 補尾:未顯示過的 suffix 可原子追加(不限 12 字,不算改舊字);
+        # 對不齊已提交前綴時保留穩定文字,絕不靜默漏字 → 記 missed_tail
+        missed_tail = False
+        if line.startswith(tr.la_commit):
+            stable = line
+        else:
+            stable = tr.la_commit or line
+            missed_tail = bool(tr.la_commit)
         # 純贅詞碎片(呃/嗯/,然後…)不上畫面、不進 2-pass,只留紀錄
         core = "".join(ch for ch in line if ch.isalnum())
         filler = len(core) <= 6 and all(ch in FILLER_CHARS for ch in core)
@@ -390,6 +401,7 @@ def main():
               "audio_start": round((tr.utt_start_sample or 0) / tr.sr, 2),
               "audio_end": round(tr.total / tr.sr, 2),
               "dropped": "filler" if filler else ("bleed" if bleed else None),
+              "missed_tail": missed_tail,
               "revised_vs_shown": stable != line})
         ts = dt.datetime.fromtimestamp(tr.utt_start or time.time())
         sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
@@ -407,6 +419,8 @@ def main():
             rec_line["bleed"] = True
         if stable != line:
             rec_line["shown"] = stable
+        if missed_tail:
+            rec_line["missed_tail"] = True
         jsonl.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
         jsonl.flush()
         records.append(rec_line)
@@ -425,6 +439,7 @@ def main():
 
     ov_live_sent = [None]
     display_owner = [None]
+    last_busy = [0.0]
     utt_counter = [0]
     t0 = time.time()
     try:
@@ -458,23 +473,11 @@ def main():
                 sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
                 partial_shown = ""
                 print(ln, flush=True)
-            # 顯示仲裁:①喇叭出聲期間 mic 多半是回授,不得搶畫面;
-            # ②一句講完前畫面不換軌(所有權),另一軌內容等定稿再以 final 併入
+            # LA 時鐘每軌獨立跑:不論誰在畫面上,各軌的提交前綴照常累積
             talking = [tr for tr in tracks if rec.get_result(tr.stream_s)]
             now = time.time()
-            cands = [t2 for t2 in talking
-                     if not (t2.name == "mic" and lb_tr is not None
-                             and now - lb_tr.last_loud < 0.7)]
-            owner = display_owner[0]
-            if owner not in cands or owner.utt_id is None:
-                owner = min(cands, key=lambda t2: t2.utt_start or now) if cands else None
-                display_owner[0] = owner
-            show = ""
-            disp = ""
-            if owner is not None:
-                tr = owner
+            for tr in talking:
                 full = to_display(rec.get_result(tr.stream_s))
-                now = time.time()
                 if now - tr.la_t >= 0.4:  # 取樣節奏:兩輪一致的前綴才提交
                     tr.la_t = now
                     if tr.la_last:
@@ -492,14 +495,31 @@ def main():
                         # 孤立單字不單獨提交:一次至少推進 2 字,等下一批一起顯示
                         if len(cand) - len(tr.la_commit) >= 2 and cand.startswith(tr.la_commit):
                             tr.la_commit = cand
-                            rlog({"ev": "live_commit", "utt": tr.utt_id, "len": len(cand)})
+                            rlog({"ev": "live_commit", "utt": tr.utt_id, "track": tr.name,
+                                  "len": len(cand)})
                     # 浮動尾端上限 12 字:更早的內容即使未達成共識也強制提交
                     if full.startswith(tr.la_commit) and len(full) - len(tr.la_commit) > 12:
                         tr.la_commit = full[:len(full) - 12]
                     tr.la_last = full
+            # 活動心跳:任一軌句子進行中就禁止 overlay 清屏(清除倒數只從 final 起算)
+            if any(t2.utt_id is not None for t2 in tracks) and now - last_busy[0] > 1.0:
+                ov_send({"kind": "busy"})
+                last_busy[0] = now
+            # 顯示仲裁:①喇叭出聲期間 mic 多半是回授,不得搶畫面;
+            # ②一句講完前畫面不換軌(所有權),另一軌內容等定稿再以 final 併入
+            cands = [t2 for t2 in talking
+                     if not (t2.name == "mic" and lb_tr is not None
+                             and now - lb_tr.last_loud < 0.7)]
+            owner = display_owner[0]
+            if owner not in cands or owner.utt_id is None:
+                owner = min(cands, key=lambda t2: t2.utt_start or now) if cands else None
+                display_owner[0] = owner
+            show = ""
+            if owner is not None:
+                tr = owner
+                full = to_display(rec.get_result(tr.stream_s))
                 tail = full[len(tr.la_commit):] if full.startswith(tr.la_commit) else ""
-                disp = tr.la_commit + tail
-                show = f"… [{tr.label}] {disp}"[-80:]
+                show = f"… [{tr.label}] {tr.la_commit + tail}"[-80:]
                 st = (tr.utt_id, tr.la_commit, tail)
                 if st != ov_live_sent[0]:
                     ov_send({"kind": "live", "utt": tr.utt_id,
