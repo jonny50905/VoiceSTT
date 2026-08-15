@@ -4,7 +4,7 @@
 由 live_subtitles.py 以子程序啟動,stdin 每行一個 JSON 事件:
   {"kind":"partial","text":"..."}          # 進行中句子(草稿,持續更新)
   {"kind":"final","seq":7,"text":"..."}    # 句子定稿(草稿品質)
-  {"kind":"refined","seq":7,"text":"..."}  # 2-pass 修正,取代同 seq 的定稿文字
+  (顯示層單軌、永不回改:2-pass 校正只進紀錄檔,不再有 refined 顯示事件)
 單獨驗收:python overlay.py --demo
 
 實作:Tk 無邊框視窗 + 色鍵透明(背景色整塊摳掉)+ WS_EX_TRANSPARENT
@@ -40,7 +40,6 @@ class Overlay:
         self.wrap = int(sw * width_ratio)
         self.committed = None  # (seq, text, wall)
         self.partial = ""
-        self.white_partial = None  # (utt, text):進行中句子的 Breeze 增量修正
         self.q = queue.Queue()
         self.dirty = True
 
@@ -84,29 +83,15 @@ class Overlay:
             kind = ev.get("kind")
             if kind == "partial":
                 self.partial = ev["text"]
-            elif kind == "white_partial":
-                self.white_partial = (ev.get("utt"), ev["text"], time.time())
             elif kind == "final":
-                # 清掉該句「以及所有更舊句」的白字——過期快照的競態可能把死句貼回來
-                if self.white_partial and (ev.get("utt") is None
-                                           or (self.white_partial[0] or 0) <= (ev.get("utt") or 0)):
-                    self.white_partial = None
                 self.committed = (ev.get("seq"), ev["text"], time.time())
                 self.partial = ""
-            elif kind == "refined":
-                if self.committed and self.committed[0] == ev.get("seq"):
-                    self.committed = (self.committed[0], ev["text"], time.time())
-                else:  # 對應定稿已被更新的句子蓋掉,仍以修正文字短暫顯示
-                    self.committed = (ev.get("seq"), ev["text"], time.time())
             elif kind == "eof":
                 self.root.destroy()
                 return
             self.dirty = True
         if self.committed and time.time() - self.committed[2] > HOLD:
             self.committed = None
-            self.dirty = True
-        if self.white_partial and time.time() - self.white_partial[2] > 6.0:
-            self.white_partial = None  # 增量白字超過 6s 沒更新=洩漏,自動清
             self.dirty = True
         if self.dirty:
             self._redraw()
@@ -128,12 +113,9 @@ class Overlay:
     def _redraw(self):
         self.canvas.delete("all")
         y = self.h - 8
-        if self.partial:
-            y = self._text_block(self.partial, y, "#d8d8d8") - 6
-        # 進行中句子的 Breeze 增量修正優先於上一句定稿
-        if self.white_partial:
-            self._text_block(self.white_partial[1], y, "white")
-        elif self.committed:
+        if self.partial:  # 單軌全白:進行中文字已由上游 LocalAgreement 穩定化
+            y = self._text_block(self.partial, y, "white") - 6
+        if self.committed:
             self._text_block(self.committed[1], y, "white")
 
     def run(self):
@@ -147,10 +129,8 @@ def demo_feed():
         {"kind": "partial", "text": "那我們會以這個例子做情境, 看 Orbit 怎麼"},
         {"kind": "final", "seq": 1, "text": "那我們會以這個例子做情境, 看 Orbit 怎麼陪漢神"},
         {"kind": "partial", "text": "走這個檔期"},
-        {"kind": "refined", "seq": 1, "text": "那我們會以這個例子做情境,看 Orbit 怎麼陪漢神走這個檔期。"},
         {"kind": "partial", "text": "走這個檔期。首先是 Orbit 到底能帶給漢神什麼效益"},
         {"kind": "final", "seq": 2, "text": "首先是 Orbit 到底能帶給漢神什麼效益, 我們先一頁"},
-        {"kind": "refined", "seq": 2, "text": "首先是 Orbit 到底能帶給漢神什麼效益,我們先用一頁說明。"},
     ]
     time.sleep(1)
     for ev in lines:

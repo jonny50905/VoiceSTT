@@ -1,0 +1,4 @@
+# X-ASR 熱詞範例(複製為 hotwords.txt 自行填寫;中文請用簡體=模型字集)
+# 需模型目錄有 bpe.vocab:pip install sentencepiece 後由 bpe.model 匯出
+欧批
+OP

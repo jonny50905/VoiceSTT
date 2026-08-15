@@ -19,3 +19,6 @@ venv/
 # 雜項
 .DS_Store
 Thumbs.db
+
+# 熱詞(本機自訂,不入版控)
+live/hotwords.txt

@@ -68,21 +68,6 @@ def load_terms(path: Path):
     return terms
 
 
-def trim_overlap(white, gray):
-    """裁掉白尾/灰頭的重疊:兩引擎斷字點與出字延遲不同,固定切點蓋不住。
-    灰頭(忽略標點/空白)只要是白字的尾綴就裁,取最長符合(≥2 字防誤傷)。"""
-    import re
-    strip = re.compile(r"[\s\W_]+", re.UNICODE)
-    w = strip.sub("", white)
-    best = 0
-    acc = ""
-    for i, ch in enumerate(gray[:30]):
-        acc += strip.sub("", ch)
-        if len(acc) >= 2 and w.endswith(acc):
-            best = i + 1
-    return gray[best:]
-
-
 def apply_terms(text, terms):
     import re
     for a, b in terms:
@@ -143,10 +128,11 @@ class Track:
         self.wav.setframerate(self.sr)
         self.utt_start = None  # 該行第一個非空 partial 的掛鐘時間
         self.utt_start_sample = None  # 同上,但記樣本位移(供 2-pass 切片)
-        self.utt_id = None  # 全域句編號(增量修正用)
-        self.snap_rev = 0  # 句內快照版本
-        self.last_snap = 0.0
-        self.snap_disps = {}  # rev -> 快照當下的顯示文字(灰尾巴切點)
+        self.utt_id = None  # 全域句編號
+        # LocalAgreement:兩輪取樣一致的前綴才提交,已提交的字永不回改
+        self.la_last = ""  # 上次取樣的完整假設
+        self.la_commit = ""  # 已提交前綴
+        self.la_t = 0.0  # 上次取樣時間
         self.total = 0  # 累計餵入樣本數(含 keepalive 靜音)
         self.buf = []  # 滾動 PCM 緩衝(mono int16 陣列串),供 2-pass 回切句音訊
         self.buf_start = 0  # buf[0] 開頭對應的樣本位移
@@ -249,6 +235,14 @@ def main():
         BASE / "live" / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     session.mkdir(parents=True, exist_ok=True)
 
+    # 熱詞:未指定時用腳本旁的 hotwords.txt(要 bpe.vocab 才能編碼,無則跳過)
+    if not args.hotwords:
+        hp = Path(__file__).parent / "hotwords.txt"
+        args.hotwords = str(hp) if hp.exists() else None
+    if args.hotwords and not (Path(args.model) / "bpe.vocab").exists():
+        print("hotwords 需要模型目錄有 bpe.vocab(sentencepiece 自 bpe.model 匯出),本次停用", flush=True)
+        args.hotwords = None
+
     ensure_model(Path(args.model))
     print(f"載入模型 {Path(args.model).name} ...", flush=True)
     try:
@@ -284,6 +278,14 @@ def main():
     import subprocess
     import threading
 
+    # UI render event log:每個顯示決策(提交/定稿/丟棄與原因)落盤,回放對照抓回跳用
+    render_log = open(session / "render_log.jsonl", "a", encoding="utf-8")
+
+    def rlog(ev):
+        ev["w"] = round(time.time(), 3)
+        render_log.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        render_log.flush()
+
     # 電影字幕式螢幕疊加層(只有文字浮在畫面上,滑鼠穿透)
     overlay_proc = None
     ov_lock = threading.Lock()
@@ -307,7 +309,6 @@ def main():
     refine_dir = None
     refiner_proc = None
     refined_q = queue.Queue()
-    white_state = [None]  # 最新 refined_partial 事件(pump 執行緒寫,主迴圈讀)
     if not args.no_refine:
         refine_dir = session / "refine_queue"
         refine_dir.mkdir(exist_ok=True)
@@ -327,11 +328,10 @@ def main():
                     refined_q.put(ln)
                     continue
                 if ev.get("kind") == "refined":
+                    # 校正版只進紀錄與 console,不上畫面(顯示層單軌、永不回改)
                     refined_q.put(f"⟳+{ev.get('lag_s', '?')}s[{ev['t'][11:]}][{ev['label']}] {ev['text']}")
-                    ov_send({"kind": "refined", "seq": ev.get("seq"), "text": ev["text"]})
-                elif ev.get("kind") == "refined_partial":
-                    white_state[0] = ev  # 主迴圈用來切灰尾巴
-                    ov_send({"kind": "white_partial", "utt": ev["utt"], "text": ev["text"]})
+                    rlog({"ev": "refined", "utt": ev.get("utt"), "seq": ev.get("seq"),
+                          "lag_s": ev.get("lag_s"), "applied": "jsonl_only"})
                 elif ev.get("kind") == "status":
                     refined_q.put(ev["msg"])
                 else:
@@ -342,23 +342,40 @@ def main():
     partial_shown = ""
     seq = 0
 
+    FILLER_CHARS = set("呃嗯啊哦欸喔嘿哎唉就然後這些那個")
+
     def emit(tr, text):
         nonlocal partial_shown, seq
         seq += 1
         raw = s2twp.convert(text.strip())
         line = to_display(text.strip())
-        ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": line})
+        # 顯示版不回改:已提交前綴優先,定稿只能在其後延伸
+        stable = line if line.startswith(tr.la_commit) else (tr.la_commit or line)
+        # 純贅詞碎片(呃/嗯/,然後…)不上畫面、不進 2-pass,只留紀錄
+        core = "".join(ch for ch in line if ch.isalnum())
+        filler = len(core) <= 3 and all(ch in FILLER_CHARS for ch in core)
+        if not filler:
+            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": stable})
+        rlog({"ev": "final", "utt": tr.utt_id, "seq": seq,
+              "audio_start": round((tr.utt_start_sample or 0) / tr.sr, 2),
+              "audio_end": round(tr.total / tr.sr, 2),
+              "dropped": "filler" if filler else None,
+              "revised_vs_shown": stable != line})
         ts = dt.datetime.fromtimestamp(tr.utt_start or time.time())
         sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
         partial_shown = ""
-        print(f"[{ts:%H:%M:%S}][{tr.label}] {line}", flush=True)
+        print(f"[{ts:%H:%M:%S}][{tr.label}]{'(贅詞略)' if filler else ''} {line}", flush=True)
         rec_line = {"t": ts.isoformat(timespec="seconds"), "track": tr.name,
                     "label": tr.label, "text": line}
         if line != raw:
             rec_line["raw"] = raw
+        if filler:
+            rec_line["filler"] = True
+        if stable != line:
+            rec_line["shown"] = stable
         jsonl.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
         jsonl.flush()
-        if refine_dir is not None and tr.utt_start_sample is not None:
+        if refine_dir is not None and tr.utt_start_sample is not None and not filler:
             clip = tr.slice_from(tr.utt_start_sample - int(1.5 * tr.sr))  # 前補 1.5s 防切頭
             qw = wave.open(str(refine_dir / f"{seq:06d}.wav"), "wb")
             qw.setnchannels(1)
@@ -389,9 +406,9 @@ def main():
                     tr.utt_start_sample = tr.total
                     utt_counter[0] += 1
                     tr.utt_id = utt_counter[0]
-                    tr.snap_rev = 0
-                    tr.last_snap = tr.utt_start
-                    tr.snap_disps = {}
+                    tr.la_last = ""
+                    tr.la_commit = ""
+                    tr.la_t = tr.utt_start
                 if rec.is_endpoint(tr.stream_s):
                     if text.strip():
                         emit(tr, text)
@@ -400,45 +417,38 @@ def main():
                     tr.utt_start_sample = None
                     tr.utt_id = None
                     continue
-                # 增量修正:句子進行中,每 1.2s 把「目前為止」丟給 Breeze,白字不等句尾
-                now = time.time()
-                if (refine_dir is not None and tr.utt_start is not None
-                        and now - tr.last_snap >= 1.2 and now - tr.utt_start >= 2.0
-                        and text.strip()):
-                    tr.snap_rev += 1
-                    tr.last_snap = now
-                    tr.snap_disps[tr.snap_rev] = to_display(text)
-                    clip = tr.slice_from(tr.utt_start_sample - int(1.0 * tr.sr))
-                    stem = f"p{tr.utt_id:06d}_{tr.snap_rev:03d}"
-                    qw = wave.open(str(refine_dir / f"{stem}.wav"), "wb")
-                    qw.setnchannels(1)
-                    qw.setsampwidth(2)
-                    qw.setframerate(tr.sr)
-                    qw.writeframes(clip.tobytes())
-                    qw.close()
-                    (refine_dir / f"{stem}.json").write_text(json.dumps(
-                        {"partial": True, "utt": tr.utt_id, "rev": tr.snap_rev,
-                         "label": tr.label, "wall": now}, ensure_ascii=False), encoding="utf-8")
             while not refined_q.empty():
                 ln = refined_q.get()
                 sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
                 partial_shown = ""
                 print(ln, flush=True)
-            # 部分結果顯示:取最近開口的那軌
+            # 部分結果顯示:取最近開口的那軌,經 LocalAgreement 穩定化後上畫面
             talking = [tr for tr in tracks if rec.get_result(tr.stream_s)]
             show = ""
             disp = ""
             if talking:
                 tr = max(talking, key=lambda t: t.utt_start or 0)
-                disp = to_display(rec.get_result(tr.stream_s))
+                full = to_display(rec.get_result(tr.stream_s))
+                now = time.time()
+                if now - tr.la_t >= 0.4:  # 取樣節奏:兩輪一致的前綴才提交
+                    tr.la_t = now
+                    if tr.la_last:
+                        n = 0
+                        for a, b in zip(tr.la_last, full):
+                            if a != b:
+                                break
+                            n += 1
+                        cand = full[:n]
+                        if len(cand) > len(tr.la_commit) and cand.startswith(tr.la_commit):
+                            tr.la_commit = cand
+                            rlog({"ev": "la_commit", "utt": tr.utt_id, "len": len(cand)})
+                    # 浮動尾端上限 12 字:更早的內容即使未達成共識也強制提交
+                    if full.startswith(tr.la_commit) and len(full) - len(tr.la_commit) > 12:
+                        tr.la_commit = full[:len(full) - 12]
+                    tr.la_last = full
+                disp = tr.la_commit + (full[len(tr.la_commit):]
+                                       if full.startswith(tr.la_commit) else "")
                 show = f"… [{tr.label}] {disp}"[-80:]
-                # 白字已推進到某快照時,灰字只留快照之後的尾巴
-                ws = white_state[0]
-                if ws and ws.get("utt") == tr.utt_id and ws.get("cut_rev") in tr.snap_disps:
-                    cut = tr.snap_disps[ws["cut_rev"]]
-                    if disp.startswith(cut):
-                        disp = disp[len(cut):]
-                    disp = trim_overlap(ws.get("text", ""), disp)
             if disp != ov_partial_sent[0]:
                 ov_send({"kind": "partial", "text": disp})
                 ov_partial_sent[0] = disp
@@ -479,6 +489,7 @@ def main():
         for tr in tracks:
             tr.close()
         jsonl.close()
+        render_log.close()
         p.terminate()
 
 

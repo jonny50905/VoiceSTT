@@ -44,8 +44,10 @@ python live\live_subtitles.py --list-devices  # 列裝置
 ```
 
 - 模型:X-ASR-zh-en 串流 zipformer(480ms chunk,int8,首次執行自動下載 ~128MB);GPU 優先(`--provider cpu` 可退,輸出一致,RTF 仍 <0.3)。
-- **增量 2-pass 修正(預設啟用)**:句子進行中每 ~1.2 秒把「目前為止」丟給獨立 refiner 子程序(Breeze-ASR-25,GPU)重跑,白色修正文字**邊講邊推進**、不等句尾;句尾再出完整 `⟳` 修正行(0.6~1.5 秒),寫入 `subtitles_refined.jsonl`。`--no-refine` 可關。兩程序刻意分離以避開 onnxruntime/CTranslate2 同程序 CUDA 衝突。
-- **電影字幕式螢幕疊加(預設啟用)**:字幕直接浮在螢幕下方,只有文字、無視窗無背景,滑鼠事件完全穿透(含文字像素),不進工作列不搶焦點;進行中草稿灰字、定稿/修正白字,無字幕 5 秒自動消失。`--no-overlay` 改回純 console。實作:Tk 色鍵透明 + `WS_EX_TRANSPARENT|NOACTIVATE|TOOLWINDOW`(`live/overlay.py`)。
+- **顯示層單軌、永不回改**:畫面只有一條白色字幕,由即時 ASR 流經 **LocalAgreement** 穩定化——連續兩輪解碼一致的前綴才提交,已提交的字永不回改,只允許尾端 ≤12 字浮動;純贅詞碎片(呃/嗯)不上畫面。每個顯示決策記錄在 `render_log.jsonl`(utterance/revision/audio 區間/丟棄原因),可與螢幕錄影逐幀對照。
+- **2-pass 校正(預設啟用,僅進紀錄)**:句尾由獨立 refiner 子程序(Breeze-ASR-25,GPU)重跑,寫入 `subtitles_refined.jsonl` 供會後使用,**不動畫面**;亂碼或與草稿差異過大的校正版直接拒絕保留原稿。`--no-refine` 可關。兩程序分離以避開 onnxruntime/CTranslate2 同程序 CUDA 衝突。
+- **熱詞偏置**:`live/hotwords.txt`(本機自訂,不入版控;中文用簡體=模型字集)存在即自動啟用,專名在解碼層就修正;需模型目錄有 `bpe.vocab`(sentencepiece 自 `bpe.model` 匯出)。
+- **電影字幕式螢幕疊加(預設啟用)**:字幕直接浮在螢幕下方,只有文字、無視窗無背景,滑鼠事件完全穿透(含文字像素),不進工作列不搶焦點,無字幕 5 秒自動消失。`--no-overlay` 改回純 console。實作:Tk 色鍵透明 + `WS_EX_TRANSPARENT|NOACTIVATE|TOOLWINDOW`(`live/overlay.py`)。
 - 設計要點:**分軌不混音**(時鐘漂移退化為時間戳誤差、避開回音重複轉錄、免費得到本地/遠端說話人分界)、WASAPI loopback 無播放時不送資料 → 內建靜音 keepalive、模型輸出為簡體 → OpenCC s2twp + `live\terms.txt` 術語映射(僅顯示層,jsonl 保留 raw)。
 - 產物在 `%LOCALAPPDATA%\meeting-minutes\live\<時間戳>\`:`subtitles.jsonl`(定稿行,含時間戳/軌別)、`mic.wav` / `loopback.wav`(分軌錄音,餵批次管線用)。
 - 即時層不做說話人分離(線上 diarization 惡化的正是「這是誰」),說話人細分交給會後批次管線。

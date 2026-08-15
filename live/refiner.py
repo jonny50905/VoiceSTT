@@ -150,16 +150,31 @@ def main():
             text = transcribe(audio)
             if text:
                 text = polish(text)
-            rec_line = {**meta, "text": text or meta["draft"], "kept_draft": not text}
+            # 守門:亂碼、或與草稿差異過大(自由改寫/幻覺)→ 拒絕校正版,保留草稿
+            gate = None
             if text:
-                del rec_line["kept_draft"]
+                if "�" in text:
+                    gate = "replacement_char"
+                else:
+                    import difflib
+                    import re
+                    n = lambda s: re.sub(r"[\s\W_]+", "", s).lower()
+                    a, b = n(meta["draft"]), n(text)
+                    if a and difflib.SequenceMatcher(None, a, b).ratio() < 0.3:
+                        gate = "too_different"
+            if gate:
+                rec_line = {**meta, "text": meta["draft"], "kept_draft": gate}
+            else:
+                rec_line = {**meta, "text": text or meta["draft"], "kept_draft": not text}
+                if text:
+                    del rec_line["kept_draft"]
             lag = time.time() - meta["wall"] if "wall" in meta else None
             if lag is not None:
                 rec_line["lag_s"] = round(lag, 2)
             out.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
             out.flush()
-            print(json.dumps({"kind": "refined", "seq": meta.get("seq"), "t": meta["t"],
-                              "label": meta["label"], "text": rec_line["text"],
+            print(json.dumps({"kind": "refined", "seq": meta.get("seq"), "utt": meta.get("utt"),
+                              "t": meta["t"], "label": meta["label"], "text": rec_line["text"],
                               "lag_s": rec_line.get("lag_s")}, ensure_ascii=False), flush=True)
             wp.unlink()
             jp.unlink()
