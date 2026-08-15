@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from live_subtitles import BASE, load_terms  # 亦順帶掛好 CUDA DLL 路徑
+from live_subtitles import BASE, apply_terms, load_terms  # 亦順帶掛好 CUDA DLL 路徑
 
 ASR_REPO = "SoybeanMilk/faster-whisper-Breeze-ASR-25"  # 同 pipeline.py
 PUNCT_MODEL = str(BASE / "models" / "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12" / "model.onnx")
@@ -77,6 +77,15 @@ def main():
             if sr != 16000:  # faster-whisper 吃 16k;整數比率線性內插即可
                 idx = np.linspace(0, len(audio) - 1, int(len(audio) * 16000 / sr))
                 audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
+            # 過短碎片(音訊去掉 1.5s 前補與 ~0.8s 尾靜音後不足 1s,或草稿 ≤3 字)Breeze 會幻覺,保留草稿
+            if len(audio) / 16000 - 2.3 < 1.0 or len(meta["draft"].strip("，。 ,.?？!")) <= 3:
+                rec_line = {**meta, "text": meta["draft"], "kept_draft": "short",
+                            "lag_s": round(time.time() - meta.get("wall", time.time()), 2)}
+                out.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
+                out.flush()
+                wp.unlink()
+                jp.unlink()
+                continue
             # 抗幻覺參數組同 pipeline.py(短句免 VAD/斷句相關項)
             segments, _ = model.transcribe(
                 audio, language="zh", task="transcribe",
@@ -86,15 +95,17 @@ def main():
             )
             text = "".join(s.text for s in segments).strip()
             if text:
-                text = cc.convert(punct.add_punctuation(text))
-                for a, b in terms:
-                    text = text.replace(a, b)
+                text = apply_terms(cc.convert(punct.add_punctuation(text)), terms)
             rec_line = {**meta, "text": text or meta["draft"], "kept_draft": not text}
             if text:
                 del rec_line["kept_draft"]
+            lag = time.time() - meta["wall"] if "wall" in meta else None
+            if lag is not None:
+                rec_line["lag_s"] = round(lag, 2)
             out.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
             out.flush()
-            print(f"⟳[{meta['t'][11:]}][{meta['label']}] {rec_line['text']}", flush=True)
+            tag = f"+{lag:.1f}s" if lag is not None else ""
+            print(f"⟳{tag}[{meta['t'][11:]}][{meta['label']}] {rec_line['text']}", flush=True)
             wp.unlink()
             jp.unlink()
     out.close()

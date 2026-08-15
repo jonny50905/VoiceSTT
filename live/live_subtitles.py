@@ -68,6 +68,16 @@ def load_terms(path: Path):
     return terms
 
 
+def apply_terms(text, terms):
+    import re
+    for a, b in terms:
+        if a.isascii():  # 英文術語用字界比對,避免誤傷含該子字串的單字(ob vs problem)
+            text = re.sub(rf"(?<![A-Za-z]){re.escape(a)}(?![A-Za-z])", b, text)
+        else:
+            text = text.replace(a, b)
+    return text
+
+
 def load_recognizer(model_dir: Path, hotwords: str | None, provider: str):
     import sherpa_onnx
 
@@ -87,7 +97,7 @@ def load_recognizer(model_dir: Path, hotwords: str | None, provider: str):
         provider=provider,
         enable_endpoint_detection=True,
         rule1_min_trailing_silence=2.4,
-        rule2_min_trailing_silence=1.0,
+        rule2_min_trailing_silence=0.8,  # 停頓 0.8s 定稿:0.6 會切出太多碎片害 2-pass 幻覺,1.0 又拖延遲
         rule3_min_utterance_length=18.0,
         decoding_method="greedy_search",
     )
@@ -237,10 +247,7 @@ def main():
     terms = load_terms(terms_path)
 
     def to_display(text):
-        out = s2twp.convert(text)
-        for a, b in terms:
-            out = out.replace(a, b)
-        return out
+        return apply_terms(s2twp.convert(text), terms)
 
     tracks = []
     if not args.loopback_only:
@@ -301,7 +308,7 @@ def main():
             qw.writeframes(clip.tobytes())
             qw.close()
             (refine_dir / f"{seq:06d}.json").write_text(json.dumps(
-                {"seq": seq, "t": rec_line["t"], "track": tr.name,
+                {"seq": seq, "t": rec_line["t"], "track": tr.name, "wall": time.time(),
                  "label": tr.label, "draft": line}, ensure_ascii=False), encoding="utf-8")
 
     t0 = time.time()
