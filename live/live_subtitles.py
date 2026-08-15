@@ -263,8 +263,15 @@ def main():
     terms_path = Path(args.terms) if args.terms else Path(__file__).parent / "terms.txt"
     terms = load_terms(terms_path)
 
+    import re as _re
+    _letters = _re.compile(r"\b(?:[A-Za-z]\s)+[A-Za-z]\b")  # 單字母序列:V I P→VIP、L A→LA
+    _decimal = _re.compile(r"(\d)\s*\.\s*(\d)")  # 0 . 5→0.5
+
     def to_display(text):
-        return apply_terms(s2twp.convert(text), terms)
+        t = s2twp.convert(text)
+        t = _letters.sub(lambda m: m.group(0).replace(" ", ""), t)
+        t = _decimal.sub(r"\1.\2", t)
+        return apply_terms(t, terms)
 
     tracks = []
     if not args.loopback_only:
@@ -327,11 +334,11 @@ def main():
                 except json.JSONDecodeError:
                     refined_q.put(ln)
                     continue
-                if ev.get("kind") == "refined":
-                    # 校正版只進紀錄與 console,不上畫面(顯示層單軌、永不回改)
-                    refined_q.put(f"⟳+{ev.get('lag_s', '?')}s[{ev['t'][11:]}][{ev['label']}] {ev['text']}")
-                    rlog({"ev": "refined", "utt": ev.get("utt"), "seq": ev.get("seq"),
-                          "lag_s": ev.get("lag_s"), "applied": "jsonl_only"})
+                if ev.get("kind") == "offline":
+                    # 離線校正只進紀錄與 console,不上畫面(顯示層=LA 穩定直播字幕,永不回改)
+                    refined_q.put(f"⟳offline+{ev.get('lag_s', '?')}s[{ev['t'][11:]}][{ev['label']}] {ev['text']}")
+                    rlog({"ev": "offline", "utt": ev.get("utt"), "seq": ev.get("seq"),
+                          "lag_s": ev.get("lag_s"), "applied": "record_only"})
                 elif ev.get("kind") == "status":
                     refined_q.put(ev["msg"])
                 else:
@@ -355,8 +362,7 @@ def main():
         core = "".join(ch for ch in line if ch.isalnum())
         filler = len(core) <= 6 and all(ch in FILLER_CHARS for ch in core)
         if not filler:
-            shown = ("…" + stable[-60:]) if len(stable) > 60 else stable
-            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": shown})
+            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": stable})
         rlog({"ev": "final", "utt": tr.utt_id, "seq": seq,
               "audio_start": round((tr.utt_start_sample or 0) / tr.sr, 2),
               "audio_end": round(tr.total / tr.sr, 2),
@@ -389,7 +395,7 @@ def main():
                  "utt": tr.utt_id, "label": tr.label, "draft": line},
                 ensure_ascii=False), encoding="utf-8")
 
-    ov_partial_sent = [""]
+    ov_live_sent = [None]
     utt_counter = [0]
     t0 = time.time()
     try:
@@ -440,21 +446,27 @@ def main():
                                 break
                             n += 1
                         cand = full[:n]
-                        if len(cand) > len(tr.la_commit) and cand.startswith(tr.la_commit):
+                        # 提交點不落在英文單字中間(避免 mic wa 這種半個單字上畫面)
+                        while (cand and cand[-1].isascii() and cand[-1].isalpha()
+                               and n < len(full) and full[n].isascii() and full[n].isalpha()):
+                            cand = cand[:-1]
+                            n -= 1
+                        # 孤立單字不單獨提交:一次至少推進 2 字,等下一批一起顯示
+                        if len(cand) - len(tr.la_commit) >= 2 and cand.startswith(tr.la_commit):
                             tr.la_commit = cand
-                            rlog({"ev": "la_commit", "utt": tr.utt_id, "len": len(cand)})
+                            rlog({"ev": "live_commit", "utt": tr.utt_id, "len": len(cand)})
                     # 浮動尾端上限 12 字:更早的內容即使未達成共識也強制提交
                     if full.startswith(tr.la_commit) and len(full) - len(tr.la_commit) > 12:
                         tr.la_commit = full[:len(full) - 12]
                     tr.la_last = full
-                disp = tr.la_commit + (full[len(tr.la_commit):]
-                                       if full.startswith(tr.la_commit) else "")
+                tail = full[len(tr.la_commit):] if full.startswith(tr.la_commit) else ""
+                disp = tr.la_commit + tail
                 show = f"… [{tr.label}] {disp}"[-80:]
-            if len(disp) > 60:  # 長句只顯示尾端(電影字幕慣例),完整內容仍進紀錄
-                disp = "…" + disp[-60:]
-            if disp != ov_partial_sent[0]:
-                ov_send({"kind": "partial", "text": disp})
-                ov_partial_sent[0] = disp
+                st = (tr.utt_id, tr.la_commit, tail)
+                if st != ov_live_sent[0]:
+                    ov_send({"kind": "live", "utt": tr.utt_id,
+                             "committed": tr.la_commit, "tail": tail})
+                    ov_live_sent[0] = st
             if show != partial_shown:
                 pad = max(0, len(partial_shown) - len(show))
                 sys.stdout.write("\r" + show + " " * pad)

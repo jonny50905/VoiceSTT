@@ -6,7 +6,7 @@
 
 - 讀 <session_dir>/refine_queue/NNNNNN.json(+同名 .wav),依序重跑
 - Breeze(faster-whisper CT2,GPU)+ CT-Transformer 標點(CPU)+ s2twp + 術語映射
-- 修正行寫 <session_dir>/subtitles_refined.jsonl 並印到 stdout(⟳ 前綴,母程序轉印)
+- 修正行寫 <session_dir>/subtitles_offline.jsonl 並印到 stdout(⟳ 前綴,母程序轉印)
 - 佇列清空且見到 DONE 檔即退出
 - 刻意獨立程序:與 sherpa-onnx CUDA(live 程序)隔離;本程序內 CT2 之後 ORT 只能 CPU(Error 1114),標點模型本來就跑 CPU,安全
 """
@@ -84,7 +84,7 @@ def main():
 
     done_utts = set()
     part_state = {}  # utt -> {"prev": 上次整句解碼, "shown": 已確認前綴, "cut_rev": 前綴對應的快照版}
-    out = open(session / "subtitles_refined.jsonl", "a", encoding="utf-8")
+    out = open(session / "subtitles_offline.jsonl", "a", encoding="utf-8")
     while True:
         items = sorted(qdir.glob("*.json"))
         if not items:
@@ -173,7 +173,7 @@ def main():
                 rec_line["lag_s"] = round(lag, 2)
             out.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
             out.flush()
-            print(json.dumps({"kind": "refined", "seq": meta.get("seq"), "utt": meta.get("utt"),
+            print(json.dumps({"kind": "offline", "seq": meta.get("seq"), "utt": meta.get("utt"),
                               "t": meta["t"], "label": meta["label"], "text": rec_line["text"],
                               "lag_s": rec_line.get("lag_s")}, ensure_ascii=False), flush=True)
             wp.unlink()
