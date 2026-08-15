@@ -33,6 +33,21 @@ Claude 會自動觸發 `meeting-minutes` skill,依 SKILL.md 的 SOP:背景跑管
 
 產物在 `%LOCALAPPDATA%\meeting-minutes\work\<音檔名>\`,主要是 `transcript_body.md`(逐字稿正文)與 `recluster_*.json`(說話人數診斷)。
 
+## 即時字幕(live,實驗性)
+
+會議進行中直接出即時字幕(延遲約 1–2 秒),與批次管線互補:即時層出草稿,會後拿錄下的分軌 WAV 跑批次管線出權威版。
+
+```powershell
+python live\live_subtitles.py                  # 雙軌:麥克風(本地)+ 系統聲音(遠端,Teams/Meet 對方)
+python live\live_subtitles.py --mic-only      # 實體會議
+python live\live_subtitles.py --list-devices  # 列裝置
+```
+
+- 模型:X-ASR-zh-en 串流 zipformer(480ms chunk,int8,首次執行自動下載 ~128MB);GPU 優先(`--provider cpu` 可退,輸出一致,RTF 仍 <0.3)。
+- 設計要點:**分軌不混音**(時鐘漂移退化為時間戳誤差、避開回音重複轉錄、免費得到本地/遠端說話人分界)、WASAPI loopback 無播放時不送資料 → 內建靜音 keepalive、模型輸出為簡體 → OpenCC s2twp + `live\terms.txt` 術語映射(僅顯示層,jsonl 保留 raw)。
+- 產物在 `%LOCALAPPDATA%\meeting-minutes\live\<時間戳>\`:`subtitles.jsonl`(定稿行,含時間戳/軌別)、`mic.wav` / `loopback.wav`(分軌錄音,餵批次管線用)。
+- 即時層不做說話人分離(線上 diarization 惡化的正是「這是誰」),說話人細分交給會後批次管線。
+
 ## 管線架構與模型
 
 | 步驟 | 做什麼 | 模型 | 裝置 |

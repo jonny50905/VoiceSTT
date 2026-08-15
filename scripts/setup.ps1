@@ -32,7 +32,8 @@ $py = "$venv\Scripts\python.exe"
     scikit-learn==1.9.0 `
     huggingface_hub==1.25.1 `
     nvidia-cublas-cu12==12.9.2.10 `
-    nvidia-cudnn-cu12==9.24.0.43
+    nvidia-cudnn-cu12==9.24.0.43 `
+    pyaudiowpatch==0.2.12.8
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 # sherpa-onnx: CUDA wheel on NVIDIA machines (diarize ~3.6x faster, validated
