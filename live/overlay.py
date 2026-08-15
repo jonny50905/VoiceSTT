@@ -40,6 +40,7 @@ class Overlay:
         self.wrap = int(sw * width_ratio)
         self.committed = None  # (seq, text, wall)
         self.partial = ""
+        self.white_partial = None  # (utt, text):進行中句子的 Breeze 增量修正
         self.q = queue.Queue()
         self.dirty = True
 
@@ -83,7 +84,11 @@ class Overlay:
             kind = ev.get("kind")
             if kind == "partial":
                 self.partial = ev["text"]
+            elif kind == "white_partial":
+                self.white_partial = (ev.get("utt"), ev["text"])
             elif kind == "final":
+                if self.white_partial and self.white_partial[0] == ev.get("utt"):
+                    self.white_partial = None
                 self.committed = (ev.get("seq"), ev["text"], time.time())
                 self.partial = ""
             elif kind == "refined":
@@ -120,7 +125,10 @@ class Overlay:
         y = self.h - 8
         if self.partial:
             y = self._text_block(self.partial, y, "#d8d8d8") - 6
-        if self.committed:
+        # 進行中句子的 Breeze 增量修正優先於上一句定稿
+        if self.white_partial:
+            self._text_block(self.white_partial[1], y, "white")
+        elif self.committed:
             self._text_block(self.committed[1], y, "white")
 
     def run(self):

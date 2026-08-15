@@ -128,6 +128,10 @@ class Track:
         self.wav.setframerate(self.sr)
         self.utt_start = None  # 該行第一個非空 partial 的掛鐘時間
         self.utt_start_sample = None  # 同上,但記樣本位移(供 2-pass 切片)
+        self.utt_id = None  # 全域句編號(增量修正用)
+        self.snap_rev = 0  # 句內快照版本
+        self.last_snap = 0.0
+        self.snap_disps = {}  # rev -> 快照當下的顯示文字(灰尾巴切點)
         self.total = 0  # 累計餵入樣本數(含 keepalive 靜音)
         self.buf = []  # 滾動 PCM 緩衝(mono int16 陣列串),供 2-pass 回切句音訊
         self.buf_start = 0  # buf[0] 開頭對應的樣本位移
@@ -288,6 +292,7 @@ def main():
     refine_dir = None
     refiner_proc = None
     refined_q = queue.Queue()
+    white_state = [None]  # 最新 refined_partial 事件(pump 執行緒寫,主迴圈讀)
     if not args.no_refine:
         refine_dir = session / "refine_queue"
         refine_dir.mkdir(exist_ok=True)
@@ -309,6 +314,9 @@ def main():
                 if ev.get("kind") == "refined":
                     refined_q.put(f"⟳+{ev.get('lag_s', '?')}s[{ev['t'][11:]}][{ev['label']}] {ev['text']}")
                     ov_send({"kind": "refined", "seq": ev.get("seq"), "text": ev["text"]})
+                elif ev.get("kind") == "refined_partial":
+                    white_state[0] = ev  # 主迴圈用來切灰尾巴
+                    ov_send({"kind": "white_partial", "utt": ev["utt"], "text": ev["text"]})
                 elif ev.get("kind") == "status":
                     refined_q.put(ev["msg"])
                 else:
@@ -324,7 +332,7 @@ def main():
         seq += 1
         raw = s2twp.convert(text.strip())
         line = to_display(text.strip())
-        ov_send({"kind": "final", "seq": seq, "text": line})
+        ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": line})
         ts = dt.datetime.fromtimestamp(tr.utt_start or time.time())
         sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
         partial_shown = ""
@@ -345,9 +353,11 @@ def main():
             qw.close()
             (refine_dir / f"{seq:06d}.json").write_text(json.dumps(
                 {"seq": seq, "t": rec_line["t"], "track": tr.name, "wall": time.time(),
-                 "label": tr.label, "draft": line}, ensure_ascii=False), encoding="utf-8")
+                 "utt": tr.utt_id, "label": tr.label, "draft": line},
+                ensure_ascii=False), encoding="utf-8")
 
     ov_partial_sent = [""]
+    utt_counter = [0]
     t0 = time.time()
     try:
         while args.duration is None or time.time() - t0 < args.duration:
@@ -362,12 +372,38 @@ def main():
                 if text and tr.utt_start is None:
                     tr.utt_start = time.time()
                     tr.utt_start_sample = tr.total
+                    utt_counter[0] += 1
+                    tr.utt_id = utt_counter[0]
+                    tr.snap_rev = 0
+                    tr.last_snap = tr.utt_start
+                    tr.snap_disps = {}
                 if rec.is_endpoint(tr.stream_s):
                     if text.strip():
                         emit(tr, text)
                     rec.reset(tr.stream_s)
                     tr.utt_start = None
                     tr.utt_start_sample = None
+                    tr.utt_id = None
+                    continue
+                # 增量修正:句子進行中,每 1.2s 把「目前為止」丟給 Breeze,白字不等句尾
+                now = time.time()
+                if (refine_dir is not None and tr.utt_start is not None
+                        and now - tr.last_snap >= 1.2 and now - tr.utt_start >= 2.0
+                        and text.strip()):
+                    tr.snap_rev += 1
+                    tr.last_snap = now
+                    tr.snap_disps[tr.snap_rev] = to_display(text)
+                    clip = tr.slice_from(tr.utt_start_sample - int(1.0 * tr.sr))
+                    stem = f"p{tr.utt_id:06d}_{tr.snap_rev:03d}"
+                    qw = wave.open(str(refine_dir / f"{stem}.wav"), "wb")
+                    qw.setnchannels(1)
+                    qw.setsampwidth(2)
+                    qw.setframerate(tr.sr)
+                    qw.writeframes(clip.tobytes())
+                    qw.close()
+                    (refine_dir / f"{stem}.json").write_text(json.dumps(
+                        {"partial": True, "utt": tr.utt_id, "rev": tr.snap_rev,
+                         "label": tr.label, "wall": now}, ensure_ascii=False), encoding="utf-8")
             while not refined_q.empty():
                 ln = refined_q.get()
                 sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
@@ -381,6 +417,17 @@ def main():
                 tr = max(talking, key=lambda t: t.utt_start or 0)
                 disp = to_display(rec.get_result(tr.stream_s))
                 show = f"… [{tr.label}] {disp}"[-80:]
+                # 白字已推進到某快照時,灰字只留快照之後的尾巴
+                ws = white_state[0]
+                if ws and ws.get("utt") == tr.utt_id and ws.get("rev") in tr.snap_disps:
+                    cut = tr.snap_disps[ws["rev"]]
+                    if disp.startswith(cut):
+                        disp = disp[len(cut):]
+                    wt = ws.get("text", "")  # 兩引擎斷字點不同,裁掉白灰交界的重複字
+                    for k in range(min(6, len(wt), len(disp)), 0, -1):
+                        if wt.endswith(disp[:k]):
+                            disp = disp[k:]
+                            break
             if disp != ov_partial_sent[0]:
                 ov_send({"kind": "partial", "text": disp})
                 ov_partial_sent[0] = disp

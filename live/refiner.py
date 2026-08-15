@@ -58,6 +58,31 @@ def main():
     terms = load_terms(Path(args.terms)) if args.terms else []
     print(json.dumps({"kind": "status", "msg": f"⟳ 2-pass 就緒({time.time() - t0:.0f}s)"}, ensure_ascii=False), flush=True)
 
+    def polish(text):
+        return apply_terms(cc.convert(punct.add_punctuation(text)), terms)
+
+    def read_audio(wp):
+        w = wave.open(str(wp))
+        sr = w.getframerate()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        w.close()
+        audio = pcm.astype(np.float32) / 32768.0
+        if sr != 16000:  # faster-whisper 吃 16k;整數比率線性內插即可
+            idx = np.linspace(0, len(audio) - 1, int(len(audio) * 16000 / sr))
+            audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
+        return audio
+
+    def transcribe(audio):
+        # 抗幻覺參數組同 pipeline.py(短句免 VAD/斷句相關項)
+        segments, _ = model.transcribe(
+            audio, language="zh", task="transcribe",
+            beam_size=5, best_of=5, condition_on_previous_text=False,
+            compression_ratio_threshold=None, log_prob_threshold=None,
+            no_speech_threshold=None, repetition_penalty=1.05, no_repeat_ngram_size=3,
+        )
+        return "".join(s.text for s in segments).strip()
+
+    done_utts = set()
     out = open(session / "subtitles_refined.jsonl", "a", encoding="utf-8")
     while True:
         items = sorted(qdir.glob("*.json"))
@@ -67,16 +92,34 @@ def main():
             time.sleep(0.3)
             continue
         for jp in items:
-            meta = json.loads(jp.read_text(encoding="utf-8"))
+            try:
+                meta = json.loads(jp.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
             wp = jp.with_suffix(".wav")
-            w = wave.open(str(wp))
-            sr = w.getframerate()
-            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-            w.close()
-            audio = pcm.astype(np.float32) / 32768.0
-            if sr != 16000:  # faster-whisper 吃 16k;整數比率線性內插即可
-                idx = np.linspace(0, len(audio) - 1, int(len(audio) * 16000 / sr))
-                audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
+            if meta.get("partial"):
+                # 增量快照:同句已有更新版、或該句已定稿 → 過期跳過,不浪費 GPU
+                utt, rev = meta["utt"], meta["rev"]
+                newer = any(int(p.stem.split("_")[1]) > rev
+                            for p in qdir.glob(f"p{utt:06d}_*.json"))
+                finalized = utt in done_utts or any(
+                    json.loads(p.read_text(encoding="utf-8")).get("utt") == utt
+                    for p in qdir.glob("*.json") if p.stem.isdigit())
+                if not (newer or finalized):
+                    audio = read_audio(wp)
+                    text = transcribe(audio)
+                    if text:
+                        # 句子還在進行,去掉尾端標點免得看起來像講完了
+                        print(json.dumps(
+                            {"kind": "refined_partial", "utt": utt, "rev": rev,
+                             "text": polish(text).rstrip("。，,."),
+                             "lag_s": round(time.time() - meta["wall"], 2)},
+                            ensure_ascii=False), flush=True)
+                wp.unlink()
+                jp.unlink()
+                continue
+            done_utts.add(meta.get("utt"))
+            audio = read_audio(wp)
             # 過短碎片(音訊去掉 1.5s 前補與 ~0.8s 尾靜音後不足 1s,或草稿 ≤3 字)Breeze 會幻覺,保留草稿
             if len(audio) / 16000 - 2.3 < 1.0 or len(meta["draft"].strip("，。 ,.?？!")) <= 3:
                 rec_line = {**meta, "text": meta["draft"], "kept_draft": "short",
@@ -86,16 +129,9 @@ def main():
                 wp.unlink()
                 jp.unlink()
                 continue
-            # 抗幻覺參數組同 pipeline.py(短句免 VAD/斷句相關項)
-            segments, _ = model.transcribe(
-                audio, language="zh", task="transcribe",
-                beam_size=5, best_of=5, condition_on_previous_text=False,
-                compression_ratio_threshold=None, log_prob_threshold=None,
-                no_speech_threshold=None, repetition_penalty=1.05, no_repeat_ngram_size=3,
-            )
-            text = "".join(s.text for s in segments).strip()
+            text = transcribe(audio)
             if text:
-                text = apply_terms(cc.convert(punct.add_punctuation(text)), terms)
+                text = polish(text)
             rec_line = {**meta, "text": text or meta["draft"], "kept_draft": not text}
             if text:
                 del rec_line["kept_draft"]
