@@ -68,6 +68,21 @@ def load_terms(path: Path):
     return terms
 
 
+def trim_overlap(white, gray):
+    """裁掉白尾/灰頭的重疊:兩引擎斷字點與出字延遲不同,固定切點蓋不住。
+    灰頭(忽略標點/空白)只要是白字的尾綴就裁,取最長符合(≥2 字防誤傷)。"""
+    import re
+    strip = re.compile(r"[\s\W_]+", re.UNICODE)
+    w = strip.sub("", white)
+    best = 0
+    acc = ""
+    for i, ch in enumerate(gray[:30]):
+        acc += strip.sub("", ch)
+        if len(acc) >= 2 and w.endswith(acc):
+            best = i + 1
+    return gray[best:]
+
+
 def apply_terms(text, terms):
     import re
     for a, b in terms:
@@ -419,15 +434,11 @@ def main():
                 show = f"… [{tr.label}] {disp}"[-80:]
                 # 白字已推進到某快照時,灰字只留快照之後的尾巴
                 ws = white_state[0]
-                if ws and ws.get("utt") == tr.utt_id and ws.get("rev") in tr.snap_disps:
-                    cut = tr.snap_disps[ws["rev"]]
+                if ws and ws.get("utt") == tr.utt_id and ws.get("cut_rev") in tr.snap_disps:
+                    cut = tr.snap_disps[ws["cut_rev"]]
                     if disp.startswith(cut):
                         disp = disp[len(cut):]
-                    wt = ws.get("text", "")  # 兩引擎斷字點不同,裁掉白灰交界的重複字
-                    for k in range(min(6, len(wt), len(disp)), 0, -1):
-                        if wt.endswith(disp[:k]):
-                            disp = disp[k:]
-                            break
+                    disp = trim_overlap(ws.get("text", ""), disp)
             if disp != ov_partial_sent[0]:
                 ov_send({"kind": "partial", "text": disp})
                 ov_partial_sent[0] = disp

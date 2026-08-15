@@ -85,9 +85,11 @@ class Overlay:
             if kind == "partial":
                 self.partial = ev["text"]
             elif kind == "white_partial":
-                self.white_partial = (ev.get("utt"), ev["text"])
+                self.white_partial = (ev.get("utt"), ev["text"], time.time())
             elif kind == "final":
-                if self.white_partial and self.white_partial[0] == ev.get("utt"):
+                # 清掉該句「以及所有更舊句」的白字——過期快照的競態可能把死句貼回來
+                if self.white_partial and (ev.get("utt") is None
+                                           or (self.white_partial[0] or 0) <= (ev.get("utt") or 0)):
                     self.white_partial = None
                 self.committed = (ev.get("seq"), ev["text"], time.time())
                 self.partial = ""
@@ -102,6 +104,9 @@ class Overlay:
             self.dirty = True
         if self.committed and time.time() - self.committed[2] > HOLD:
             self.committed = None
+            self.dirty = True
+        if self.white_partial and time.time() - self.white_partial[2] > 6.0:
+            self.white_partial = None  # 增量白字超過 6s 沒更新=洩漏,自動清
             self.dirty = True
         if self.dirty:
             self._redraw()

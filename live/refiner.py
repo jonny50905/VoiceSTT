@@ -83,6 +83,7 @@ def main():
         return "".join(s.text for s in segments).strip()
 
     done_utts = set()
+    part_state = {}  # utt -> {"prev": 上次整句解碼, "shown": 已確認前綴, "cut_rev": 前綴對應的快照版}
     out = open(session / "subtitles_refined.jsonl", "a", encoding="utf-8")
     while True:
         items = sorted(qdir.glob("*.json"))
@@ -108,17 +109,34 @@ def main():
                 if not (newer or finalized):
                     audio = read_audio(wp)
                     text = transcribe(audio)
-                    if text:
-                        # 句子還在進行,去掉尾端標點免得看起來像講完了
+                    # LocalAgreement-2:連續兩次解碼一致的前綴才升白,白字只增不改,
+                    # 避免「新一輪整句重解碼把之前對的字改錯」上畫面
+                    st = part_state.setdefault(utt, {"prev": None, "shown": "", "cut_rev": None})
+                    if text and st["prev"] is not None:
+                        n = 0
+                        for a, b in zip(st["prev"], text):
+                            if a != b:
+                                break
+                            n += 1
+                        lcp = text[:n]
+                        if len(lcp) > len(st["shown"]) and lcp.startswith(st["shown"]):
+                            st["shown"] = lcp
+                            st["cut_rev"] = rev - 1  # 前綴涵蓋範圍 ≈ 上一版快照的音訊
+                    st["prev"] = text or st["prev"]
+                    # 送出前重查一次過期:解碼期間該句可能已定稿(競態會把死句白字貼回去)
+                    if st["shown"] and utt not in done_utts and not any(
+                            json.loads(p.read_text(encoding="utf-8")).get("utt") == utt
+                            for p in qdir.glob("*.json") if p.stem.isdigit()):
                         print(json.dumps(
-                            {"kind": "refined_partial", "utt": utt, "rev": rev,
-                             "text": polish(text).rstrip("。，,."),
+                            {"kind": "refined_partial", "utt": utt, "cut_rev": st["cut_rev"],
+                             "text": polish(st["shown"]).rstrip("。，,."),
                              "lag_s": round(time.time() - meta["wall"], 2)},
                             ensure_ascii=False), flush=True)
                 wp.unlink()
                 jp.unlink()
                 continue
             done_utts.add(meta.get("utt"))
+            part_state.pop(meta.get("utt"), None)
             audio = read_audio(wp)
             # 過短碎片(音訊去掉 1.5s 前補與 ~0.8s 尾靜音後不足 1s,或草稿 ≤3 字)Breeze 會幻覺,保留草稿
             if len(audio) / 16000 - 2.3 < 1.0 or len(meta["draft"].strip("，。 ,.?？!")) <= 3:
