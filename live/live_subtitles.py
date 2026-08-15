@@ -353,9 +353,10 @@ def main():
         stable = line if line.startswith(tr.la_commit) else (tr.la_commit or line)
         # 純贅詞碎片(呃/嗯/,然後…)不上畫面、不進 2-pass,只留紀錄
         core = "".join(ch for ch in line if ch.isalnum())
-        filler = len(core) <= 3 and all(ch in FILLER_CHARS for ch in core)
+        filler = len(core) <= 6 and all(ch in FILLER_CHARS for ch in core)
         if not filler:
-            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": stable})
+            shown = ("…" + stable[-60:]) if len(stable) > 60 else stable
+            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": shown})
         rlog({"ev": "final", "utt": tr.utt_id, "seq": seq,
               "audio_start": round((tr.utt_start_sample or 0) / tr.sr, 2),
               "audio_end": round(tr.total / tr.sr, 2),
@@ -449,6 +450,8 @@ def main():
                 disp = tr.la_commit + (full[len(tr.la_commit):]
                                        if full.startswith(tr.la_commit) else "")
                 show = f"… [{tr.label}] {disp}"[-80:]
+            if len(disp) > 60:  # 長句只顯示尾端(電影字幕慣例),完整內容仍進紀錄
+                disp = "…" + disp[-60:]
             if disp != ov_partial_sent[0]:
                 ov_send({"kind": "partial", "text": disp})
                 ov_partial_sent[0] = disp
