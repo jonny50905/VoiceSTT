@@ -1,0 +1,20 @@
+# 音檔與會議產物絕不入版控(隱私)
+*.m4a
+*.mp3
+*.wav
+*.mp4
+*.aac
+*.flac
+*_逐字稿.md
+*_會議摘要與待辦.md
+work/
+
+# Python / 環境
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 雜項
+.DS_Store
+Thumbs.db
