@@ -110,15 +110,21 @@ class Overlay:
                     hard = i
                     break
                 if ch in BREAKS:
-                    cut = i + 1
+                    # 1.2 / mic.wav 裡的點不是句點:兩側都是 ASCII 英數就不當斷點
+                    if (ch == "." and 0 < i < len(self.cur) - 1
+                            and self.cur[i - 1].isascii() and self.cur[i - 1].isalnum()
+                            and self.cur[i + 1].isascii() and self.cur[i + 1].isalnum()):
+                        pass
+                    else:
+                        cut = i + 1
                 elif ch == " ":
                     last_sp = i + 1
             if cut is None or _w(self.cur[:cut]) < 6:
                 cut = last_sp if (last_sp and _w(self.cur[:last_sp]) >= 6) else max(1, hard)
-                # 硬切不拆英文 token:落在字母/數字中間就退到 token 開頭
-                while (0 < cut < len(self.cur)
-                       and self.cur[cut - 1].isascii() and self.cur[cut - 1].isalnum()
-                       and self.cur[cut].isascii() and self.cur[cut].isalnum()):
+                # 硬切不拆 token:1.2、user_test8、英文單字視為不可拆(含 . _ -)
+                def _tok(ch):
+                    return ch.isascii() and (ch.isalnum() or ch in "._-")
+                while 0 < cut < len(self.cur) and _tok(self.cur[cut - 1]) and _tok(self.cur[cut]):
                     cut -= 1
                 if cut <= 1:  # 整行一個超長 token,只能硬切
                     cut = max(1, hard)
@@ -138,6 +144,10 @@ class Overlay:
             kind = ev.get("kind")
             if kind == "live":
                 if ev.get("utt") != self.cur_utt:
+                    if self.cur.strip():  # 換句/換軌必分隔:殘句先換行,絕不直接串接
+                        self.prev = self.cur.strip()
+                        self.cur = ""
+                    self.tail = ""
                     self.cur_utt = ev.get("utt")
                     self.consumed = 0
                 c = ev.get("committed", "")
@@ -148,9 +158,18 @@ class Overlay:
                 self.last_update = time.time()
             elif kind == "final":
                 t = ev.get("text", "")
-                if ev.get("utt") == self.cur_utt and len(t) > self.consumed:
-                    self._append(t[self.consumed:])
-                elif ev.get("utt") != self.cur_utt:
+                rep = ev.get("replace_last", 0)
+                if ev.get("utt") == self.cur_utt:
+                    base = self.consumed
+                    if rep and len(self.cur) >= rep:  # 尾端替換(≤12 字)還在本行才動
+                        self.cur = self.cur[:len(self.cur) - rep]
+                        base = self.consumed - rep
+                    if len(t) > base:
+                        self._append(t[base:])
+                elif t:
+                    if self.cur.strip():  # 不同句的 final:先分隔再整句上
+                        self.prev = self.cur.strip()
+                        self.cur = ""
                     self._append(t)
                 self.tail = ""
                 if self.cur.strip():  # 句子完成即換行:跨句/跨軌內容不會黏在同一行
@@ -159,6 +178,13 @@ class Overlay:
                 self.cur_utt = None
                 self.consumed = 0
                 self.last_update = time.time()
+            elif kind == "retract":
+                # 該句被判回授/贅詞丟棄:收回畫面上的進行中行(已捲出的行不動)
+                if ev.get("utt") == self.cur_utt:
+                    self.cur = ""
+                    self.tail = ""
+                    self.cur_utt = None
+                    self.consumed = 0
             elif kind == "busy":
                 # 有句子還在錄音/辨識中:重置停留倒數,活動中禁止清屏
                 self.last_update = time.time()

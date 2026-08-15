@@ -68,6 +68,38 @@ def load_terms(path: Path):
     return terms
 
 
+def align_final(commit, line):
+    """final 與已顯示前綴的對齊:回傳 (stable, replace_last, missed_tail)。
+    - commit 是 line 的前綴 → 未顯示 suffix 全量原子補上(不限字數,是新字不是回改)
+    - 分歧只在尾端 ≤12 字 → 允許替換該尾端(規格唯一允許的回改範圍)
+    - 分歧更深 → 用 commit 尾錨在 final 中找續文補尾;找不到才記 missed_tail
+    """
+    if line.startswith(commit):
+        return line, 0, False
+    n = 0
+    for a, b in zip(commit, line):
+        if a != b:
+            break
+        n += 1
+    if len(commit) - n <= 12:
+        return line, len(commit) - n, False
+    tail_alnum = "".join(ch for ch in commit if ch.isalnum())
+    for klen in (8, 6, 4):  # 錨長漸退,提高補尾命中率
+        key = tail_alnum[-klen:]
+        if len(key) < klen:
+            continue
+        acc = ""
+        pos = None
+        for i, ch in enumerate(line):
+            if ch.isalnum():
+                acc += ch
+                if acc.endswith(key):
+                    pos = i + 1
+        if pos is not None and pos < len(line):
+            return commit + line[pos:], 0, False
+    return commit, 0, True
+
+
 def apply_terms(text, terms):
     import re
     for a, b in terms:
@@ -135,6 +167,7 @@ class Track:
         self.la_t = 0.0  # 上次取樣時間
         self.last_loud = 0.0  # 此軌最近一次有聲音的時間(雙音源仲裁用)
         self.recent_finals = []  # [(start_epoch, line)] 近幾句定稿(跨軌 bleed 比對用)
+        self.suspect = False  # 本句疑似回授(live 階段即攔,不等 final)
         self.total = 0  # 累計餵入樣本數(含 keepalive 靜音)
         self.buf = []  # 滾動 PCM 緩衝(mono int16 陣列串),供 2-pass 回切句音訊
         self.buf_start = 0  # buf[0] 開頭對應的樣本位移
@@ -367,14 +400,7 @@ def main():
         seq += 1
         raw = s2twp.convert(text.strip())
         line = to_display(text.strip())
-        # final 補尾:未顯示過的 suffix 可原子追加(不限 12 字,不算改舊字);
-        # 對不齊已提交前綴時保留穩定文字,絕不靜默漏字 → 記 missed_tail
-        missed_tail = False
-        if line.startswith(tr.la_commit):
-            stable = line
-        else:
-            stable = tr.la_commit or line
-            missed_tail = bool(tr.la_commit)
+        stable, rep, missed_tail = align_final(tr.la_commit, line)
         # 純贅詞碎片(呃/嗯/,然後…)不上畫面、不進 2-pass,只留紀錄
         core = "".join(ch for ch in line if ch.isalnum())
         filler = len(core) <= 6 and all(ch in FILLER_CHARS for ch in core)
@@ -396,12 +422,15 @@ def main():
         tr.recent_finals.append((tr.utt_start or time.time(), line))
         del tr.recent_finals[:-6]
         if not filler and not bleed:
-            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id, "text": stable})
+            ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id,
+                     "text": stable, "replace_last": rep})
+        else:
+            ov_send({"kind": "retract", "utt": tr.utt_id})  # 丟棄句要收回畫面上的進行中行
         rlog({"ev": "final", "utt": tr.utt_id, "seq": seq, "track": tr.name,
               "audio_start": round((tr.utt_start_sample or 0) / tr.sr, 2),
               "audio_end": round(tr.total / tr.sr, 2),
               "dropped": "filler" if filler else ("bleed" if bleed else None),
-              "missed_tail": missed_tail,
+              "missed_tail": missed_tail, "tail_replaced": rep,
               "revised_vs_shown": stable != line})
         ts = dt.datetime.fromtimestamp(tr.utt_start or time.time())
         sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
@@ -460,6 +489,7 @@ def main():
                     tr.la_last = ""
                     tr.la_commit = ""
                     tr.la_t = tr.utt_start
+                    tr.suspect = False
                 if rec.is_endpoint(tr.stream_s):
                     if text.strip():
                         emit(tr, text)
@@ -501,6 +531,16 @@ def main():
                     if full.startswith(tr.la_commit) and len(full) - len(tr.la_commit) > 12:
                         tr.la_commit = full[:len(full) - 12]
                     tr.la_last = full
+                    # 回音提前攔截:mic 進行中文字與 loopback 相似 → 本句標 suspect,不得上畫面
+                    if (tr.name == "mic" and not tr.suspect and lb_tr is not None
+                            and len(full) >= 6 and now - lb_tr.last_loud < 2.0):
+                        import difflib
+                        b = to_display(rec.get_result(lb_tr.stream_s))
+                        na = "".join(c for c in full if c.isalnum()).lower()
+                        nb = "".join(c for c in b if c.isalnum()).lower()
+                        if na and nb and difflib.SequenceMatcher(None, na, nb).ratio() > 0.6:
+                            tr.suspect = True
+                            rlog({"ev": "suspect", "utt": tr.utt_id})
             # 活動心跳:任一軌句子進行中就禁止 overlay 清屏(清除倒數只從 final 起算)
             if any(t2.utt_id is not None for t2 in tracks) and now - last_busy[0] > 1.0:
                 ov_send({"kind": "busy"})
@@ -508,8 +548,9 @@ def main():
             # 顯示仲裁:①喇叭出聲期間 mic 多半是回授,不得搶畫面;
             # ②一句講完前畫面不換軌(所有權),另一軌內容等定稿再以 final 併入
             cands = [t2 for t2 in talking
-                     if not (t2.name == "mic" and lb_tr is not None
-                             and now - lb_tr.last_loud < 0.7)]
+                     if not t2.suspect
+                     and not (t2.name == "mic" and lb_tr is not None
+                              and now - lb_tr.last_loud < 0.7)]
             owner = display_owner[0]
             if owner not in cands or owner.utt_id is None:
                 owner = min(cands, key=lambda t2: t2.utt_start or now) if cands else None
