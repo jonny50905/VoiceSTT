@@ -102,12 +102,14 @@ def load_recognizer(model_dir: Path, hotwords: str | None, provider: str):
         decoding_method="greedy_search",
     )
     if hotwords:
+        # 實測:此模型中文為 BPE pieces,modeling_unit 必須用 "bpe"(cjkchar 查表會全滅);
+        # 需 bpe.vocab(用 sentencepiece 從 bpe.model 匯出)。A/B 實測僅 -0.5pp CER,故不預設開
         kw.update(
             decoding_method="modified_beam_search",
             hotwords_file=hotwords,
             hotwords_score=1.5,
-            modeling_unit="cjkchar+bpe",
-            bpe_vocab=str(model_dir / "bpe.model"),
+            modeling_unit="bpe",
+            bpe_vocab=str(model_dir / "bpe.vocab"),
         )
     return sherpa_onnx.OnlineRecognizer.from_transducer(**kw)
 
