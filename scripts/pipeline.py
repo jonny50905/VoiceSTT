@@ -116,6 +116,7 @@ def stage_diarize(args):
     )
     sd = None
     t0 = time.time()
+    block_secs = []  # 已完成塊的耗時,滾動估 ETA
     for i in range(n_blocks):
         bf = blkdir / f"block_{i:04d}.json"
         if bf.exists() and not args.force:
@@ -124,14 +125,24 @@ def stage_diarize(args):
             sd = sherpa_onnx.OfflineSpeakerDiarization(config)
         s = i * step
         e = total if i == n_blocks - 1 else min(total, s + DIAR_BLOCK)
+        tb = time.time()
+        last_beat = [tb]
 
-        def progress(processed, tot, _i=i):
-            # 節流:全速印會產生上千行進度洪水
-            if processed % 100 == 0 or processed == tot:
-                print(f"diarize: block {_i + 1}/{n_blocks} {processed}/{tot}", flush=True)
+        def progress(processed, tot, _i=i, _last=last_beat):
+            # 主進度以「塊完成」為單位(見下方 ETA 行);這裡只做塊內心跳,
+            # 用時間節流(≥60s 一行):GPU 塊短於 60s 幾乎不印,CPU 一塊 15 分鐘
+            # 也能看出還活著,不會回到每窗一行的進度洪水
+            now = time.time()
+            if now - _last[0] >= 60 and processed < tot:
+                _last[0] = now
+                print(f"diarize: block {_i + 1}/{n_blocks} {processed / tot:.0%}", flush=True)
             return 0
 
         result = sd.process(audio[int(s * SR):int(e * SR)], callback=progress).sort_by_start_time()
+        block_secs.append(time.time() - tb)
+        eta = (n_blocks - i - 1) * (sum(block_secs) / len(block_secs))
+        print(f"diarize: block {i + 1}/{n_blocks} 完成,{block_secs[-1]:.0f}s,預估剩 {eta / 60:.1f}m",
+              flush=True)
         # 只取 turn 邊界;此處的 speaker 標籤品質不足採信,recluster stage 會重新聚類
         turns = [{"start": s + float(r.start), "end": s + float(r.end)} for r in result]
         tmp = bf.with_suffix(".tmp")
