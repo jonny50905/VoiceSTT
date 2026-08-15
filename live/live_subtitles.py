@@ -56,6 +56,18 @@ def ensure_model(model_dir: Path):
     tmp.unlink()
 
 
+def load_terms(path: Path):
+    """讀術語顯示映射檔(錯=對,一行一組),長詞優先。refiner 也共用。"""
+    terms = []
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#") and "=" in ln:
+                terms.append(tuple(ln.split("=", 1)))
+    terms.sort(key=lambda kv: -len(kv[0]))
+    return terms
+
+
 def load_recognizer(model_dir: Path, hotwords: str | None, provider: str):
     import sherpa_onnx
 
@@ -103,6 +115,10 @@ class Track:
         self.wav.setsampwidth(2)
         self.wav.setframerate(self.sr)
         self.utt_start = None  # 該行第一個非空 partial 的掛鐘時間
+        self.utt_start_sample = None  # 同上,但記樣本位移(供 2-pass 切片)
+        self.total = 0  # 累計餵入樣本數(含 keepalive 靜音)
+        self.buf = []  # 滾動 PCM 緩衝(mono int16 陣列串),供 2-pass 回切句音訊
+        self.buf_start = 0  # buf[0] 開頭對應的樣本位移
         self.last_data = time.time()
         self.pa_stream = p.open(
             format=8,  # paInt16
@@ -132,17 +148,33 @@ class Track:
             pcm = np.frombuffer(raw, dtype=np.int16)
             if self.ch > 1:
                 pcm = pcm.reshape(-1, self.ch).mean(axis=1).astype(np.int16)
-            self.wav.writeframes(pcm.tobytes())
-            self.stream_s.accept_waveform(self.sr, pcm.astype(np.float32) / 32768.0)
+            self._ingest(pcm)
 
     def keepalive(self):
         """WASAPI loopback 無播放時不送資料 → 餵零樣本補靜音,endpoint 才會觸發、WAV 時間軸才對得上掛鐘。"""
         gap = time.time() - self.last_data
         if gap > 0.25:
-            n = int(self.sr * gap)
-            self.wav.writeframes(b"\x00\x00" * n)
-            self.stream_s.accept_waveform(self.sr, np.zeros(n, dtype=np.float32))
+            self._ingest(np.zeros(int(self.sr * gap), dtype=np.int16))
             self.last_data = time.time()
+
+    def _ingest(self, pcm):
+        self.wav.writeframes(pcm.tobytes())
+        self.stream_s.accept_waveform(self.sr, pcm.astype(np.float32) / 32768.0)
+        self.total += len(pcm)
+        self.buf.append(pcm)
+        while self.total - self.buf_start > 40 * self.sr:  # 只留最近 40s
+            self.buf_start += len(self.buf.pop(0))
+
+    def slice_from(self, start_sample):
+        """取 [start_sample, 現在] 的 mono int16(供 2-pass 重跑該句)。"""
+        start = max(start_sample, self.buf_start)
+        out, pos = [], self.buf_start
+        for a in self.buf:
+            end = pos + len(a)
+            if end > start:
+                out.append(a[max(0, start - pos):])
+            pos = end
+        return np.concatenate(out) if out else np.zeros(0, dtype=np.int16)
 
     def close(self):
         try:
@@ -162,6 +194,8 @@ def main():
     ap.add_argument("--hotwords")
     ap.add_argument("--terms", help="術語顯示映射檔(預設用腳本旁的 terms.txt)")
     ap.add_argument("--provider", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--no-refine", action="store_true",
+                    help="停用句尾 Breeze 2-pass 修正(預設啟用,另開 refiner 子程序)")
     ap.add_argument("--duration", type=float, help="跑固定秒數後自動結束(測試用)")
     ap.add_argument("--session-dir")
     ap.add_argument("--list-devices", action="store_true")
@@ -200,13 +234,7 @@ def main():
     s2twp = OpenCC("s2twp")
 
     terms_path = Path(args.terms) if args.terms else Path(__file__).parent / "terms.txt"
-    terms = []
-    if terms_path.exists():
-        for ln in terms_path.read_text(encoding="utf-8").splitlines():
-            ln = ln.strip()
-            if ln and not ln.startswith("#") and "=" in ln:
-                terms.append(tuple(ln.split("=", 1)))
-        terms.sort(key=lambda kv: -len(kv[0]))
+    terms = load_terms(terms_path)
 
     def to_display(text):
         out = s2twp.convert(text)
@@ -223,8 +251,30 @@ def main():
         tracks.append(Track("loopback", "遠端", idx, p, rec, session))
     print(f"session: {session}\n--- 開始(Ctrl+C 結束)---", flush=True)
 
+    # 句尾 2-pass:refiner 子程序吃 refine_queue 裡的句音訊,出修正行(⟳ 前綴)
+    refine_dir = None
+    refiner_proc = None
+    refined_q = queue.Queue()
+    if not args.no_refine:
+        import subprocess
+        import threading
+        refine_dir = session / "refine_queue"
+        refine_dir.mkdir(exist_ok=True)
+        refiner_proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "refiner.py"), str(session),
+             "--terms", str(terms_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+
+        def pump():
+            for ln in refiner_proc.stdout:
+                refined_q.put(ln.rstrip("\n"))
+        threading.Thread(target=pump, daemon=True).start()
+
     jsonl = open(session / "subtitles.jsonl", "a", encoding="utf-8")
     partial_shown = ""
+    seq = 0
 
     def emit(tr, text):
         nonlocal partial_shown
@@ -240,6 +290,19 @@ def main():
             rec_line["raw"] = raw
         jsonl.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
         jsonl.flush()
+        if refine_dir is not None and tr.utt_start_sample is not None:
+            nonlocal seq
+            seq += 1
+            clip = tr.slice_from(tr.utt_start_sample - int(1.5 * tr.sr))  # 前補 1.5s 防切頭
+            qw = wave.open(str(refine_dir / f"{seq:06d}.wav"), "wb")
+            qw.setnchannels(1)
+            qw.setsampwidth(2)
+            qw.setframerate(tr.sr)
+            qw.writeframes(clip.tobytes())
+            qw.close()
+            (refine_dir / f"{seq:06d}.json").write_text(json.dumps(
+                {"seq": seq, "t": rec_line["t"], "track": tr.name,
+                 "label": tr.label, "draft": line}, ensure_ascii=False), encoding="utf-8")
 
     t0 = time.time()
     try:
@@ -254,11 +317,18 @@ def main():
                 text = rec.get_result(tr.stream_s)
                 if text and tr.utt_start is None:
                     tr.utt_start = time.time()
+                    tr.utt_start_sample = tr.total
                 if rec.is_endpoint(tr.stream_s):
                     if text.strip():
                         emit(tr, text)
                     rec.reset(tr.stream_s)
                     tr.utt_start = None
+                    tr.utt_start_sample = None
+            while not refined_q.empty():
+                ln = refined_q.get()
+                sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
+                partial_shown = ""
+                print(ln, flush=True)
             # 部分結果顯示:取最近開口的那軌
             talking = [tr for tr in tracks if rec.get_result(tr.stream_s)]
             show = ""
@@ -278,6 +348,17 @@ def main():
             text = rec.get_result(tr.stream_s)
             if text.strip():
                 emit(tr, text)
+        if refiner_proc is not None:
+            (refine_dir / "DONE").touch()
+            print("\n等待 2-pass 修正收尾 ...", flush=True)
+            deadline = time.time() + 300
+            while (refiner_proc.poll() is None or not refined_q.empty()) and time.time() < deadline:
+                try:
+                    print(refined_q.get(timeout=0.3), flush=True)
+                except queue.Empty:
+                    pass
+            if refiner_proc.poll() is None:
+                refiner_proc.terminate()
         print(f"\n--- 結束,產物在 {session} ---")
         for tr in tracks:
             tr.close()

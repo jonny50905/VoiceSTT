@@ -44,6 +44,7 @@ python live\live_subtitles.py --list-devices  # 列裝置
 ```
 
 - 模型:X-ASR-zh-en 串流 zipformer(480ms chunk,int8,首次執行自動下載 ~128MB);GPU 優先(`--provider cpu` 可退,輸出一致,RTF 仍 <0.3)。
+- **句尾 2-pass 修正(預設啟用)**:每句定稿後,獨立 refiner 子程序用 Breeze-ASR-25(GPU)重跑該句音訊,數秒內輸出 `⟳` 修正行(標點、贅字平滑、辨識品質同批次管線),寫入 `subtitles_refined.jsonl`;`--no-refine` 可關。兩程序刻意分離以避開 onnxruntime/CTranslate2 同程序 CUDA 衝突。
 - 設計要點:**分軌不混音**(時鐘漂移退化為時間戳誤差、避開回音重複轉錄、免費得到本地/遠端說話人分界)、WASAPI loopback 無播放時不送資料 → 內建靜音 keepalive、模型輸出為簡體 → OpenCC s2twp + `live\terms.txt` 術語映射(僅顯示層,jsonl 保留 raw)。
 - 產物在 `%LOCALAPPDATA%\meeting-minutes\live\<時間戳>\`:`subtitles.jsonl`(定稿行,含時間戳/軌別)、`mic.wav` / `loopback.wav`(分軌錄音,餵批次管線用)。
 - 即時層不做說話人分離(線上 diarization 惡化的正是「這是誰」),說話人細分交給會後批次管線。
