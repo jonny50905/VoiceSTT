@@ -47,7 +47,7 @@ def main():
         model = WhisperModel(model_dir, device=args.device,
                              compute_type="float16" if args.device == "cuda" else "int8")
     except Exception as e:
-        print(f"⟳ Breeze {args.device} 失敗({e}),退回 CPU", flush=True)
+        print(json.dumps({"kind": "status", "msg": f"⟳ Breeze {args.device} 失敗({e}),退回 CPU"}, ensure_ascii=False), flush=True)
         model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=10)
     punct = sherpa_onnx.OfflinePunctuation(
         sherpa_onnx.OfflinePunctuationConfig(
@@ -56,7 +56,7 @@ def main():
     )
     cc = OpenCC("s2twp")
     terms = load_terms(Path(args.terms)) if args.terms else []
-    print(f"⟳ 2-pass 就緒({time.time() - t0:.0f}s)", flush=True)
+    print(json.dumps({"kind": "status", "msg": f"⟳ 2-pass 就緒({time.time() - t0:.0f}s)"}, ensure_ascii=False), flush=True)
 
     out = open(session / "subtitles_refined.jsonl", "a", encoding="utf-8")
     while True:
@@ -104,8 +104,9 @@ def main():
                 rec_line["lag_s"] = round(lag, 2)
             out.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
             out.flush()
-            tag = f"+{lag:.1f}s" if lag is not None else ""
-            print(f"⟳{tag}[{meta['t'][11:]}][{meta['label']}] {rec_line['text']}", flush=True)
+            print(json.dumps({"kind": "refined", "seq": meta.get("seq"), "t": meta["t"],
+                              "label": meta["label"], "text": rec_line["text"],
+                              "lag_s": rec_line.get("lag_s")}, ensure_ascii=False), flush=True)
             wp.unlink()
             jp.unlink()
     out.close()

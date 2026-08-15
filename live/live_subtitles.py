@@ -206,6 +206,8 @@ def main():
     ap.add_argument("--provider", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--no-refine", action="store_true",
                     help="停用句尾 Breeze 2-pass 修正(預設啟用,另開 refiner 子程序)")
+    ap.add_argument("--no-overlay", action="store_true",
+                    help="停用電影字幕式螢幕疊加層(預設啟用)")
     ap.add_argument("--duration", type=float, help="跑固定秒數後自動結束(測試用)")
     ap.add_argument("--session-dir")
     ap.add_argument("--list-devices", action="store_true")
@@ -258,13 +260,33 @@ def main():
         tracks.append(Track("loopback", "遠端", idx, p, rec, session))
     print(f"session: {session}\n--- 開始(Ctrl+C 結束)---", flush=True)
 
+    import subprocess
+    import threading
+
+    # 電影字幕式螢幕疊加層(只有文字浮在畫面上,滑鼠穿透)
+    overlay_proc = None
+    ov_lock = threading.Lock()
+    if not args.no_overlay:
+        overlay_proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "overlay.py")],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+
+    def ov_send(ev):
+        if overlay_proc is None:
+            return
+        try:
+            with ov_lock:  # emit(主執行緒)與 refiner pump(子執行緒)都會寫
+                overlay_proc.stdin.write(json.dumps(ev, ensure_ascii=False) + "\n")
+                overlay_proc.stdin.flush()
+        except OSError:
+            pass
+
     # 句尾 2-pass:refiner 子程序吃 refine_queue 裡的句音訊,出修正行(⟳ 前綴)
     refine_dir = None
     refiner_proc = None
     refined_q = queue.Queue()
     if not args.no_refine:
-        import subprocess
-        import threading
         refine_dir = session / "refine_queue"
         refine_dir.mkdir(exist_ok=True)
         refiner_proc = subprocess.Popen(
@@ -276,7 +298,19 @@ def main():
 
         def pump():
             for ln in refiner_proc.stdout:
-                refined_q.put(ln.rstrip("\n"))
+                ln = ln.rstrip("\n")
+                try:
+                    ev = json.loads(ln)
+                except json.JSONDecodeError:
+                    refined_q.put(ln)
+                    continue
+                if ev.get("kind") == "refined":
+                    refined_q.put(f"⟳+{ev.get('lag_s', '?')}s[{ev['t'][11:]}][{ev['label']}] {ev['text']}")
+                    ov_send({"kind": "refined", "seq": ev.get("seq"), "text": ev["text"]})
+                elif ev.get("kind") == "status":
+                    refined_q.put(ev["msg"])
+                else:
+                    refined_q.put(ln)
         threading.Thread(target=pump, daemon=True).start()
 
     jsonl = open(session / "subtitles.jsonl", "a", encoding="utf-8")
@@ -284,9 +318,11 @@ def main():
     seq = 0
 
     def emit(tr, text):
-        nonlocal partial_shown
+        nonlocal partial_shown, seq
+        seq += 1
         raw = s2twp.convert(text.strip())
         line = to_display(text.strip())
+        ov_send({"kind": "final", "seq": seq, "text": line})
         ts = dt.datetime.fromtimestamp(tr.utt_start or time.time())
         sys.stdout.write("\r" + " " * len(partial_shown.encode("gbk", "replace")) + "\r")
         partial_shown = ""
@@ -298,8 +334,6 @@ def main():
         jsonl.write(json.dumps(rec_line, ensure_ascii=False) + "\n")
         jsonl.flush()
         if refine_dir is not None and tr.utt_start_sample is not None:
-            nonlocal seq
-            seq += 1
             clip = tr.slice_from(tr.utt_start_sample - int(1.5 * tr.sr))  # 前補 1.5s 防切頭
             qw = wave.open(str(refine_dir / f"{seq:06d}.wav"), "wb")
             qw.setnchannels(1)
@@ -311,6 +345,7 @@ def main():
                 {"seq": seq, "t": rec_line["t"], "track": tr.name, "wall": time.time(),
                  "label": tr.label, "draft": line}, ensure_ascii=False), encoding="utf-8")
 
+    ov_partial_sent = [""]
     t0 = time.time()
     try:
         while args.duration is None or time.time() - t0 < args.duration:
@@ -339,9 +374,14 @@ def main():
             # 部分結果顯示:取最近開口的那軌
             talking = [tr for tr in tracks if rec.get_result(tr.stream_s)]
             show = ""
+            disp = ""
             if talking:
                 tr = max(talking, key=lambda t: t.utt_start or 0)
-                show = f"… [{tr.label}] {to_display(rec.get_result(tr.stream_s))}"[-80:]
+                disp = to_display(rec.get_result(tr.stream_s))
+                show = f"… [{tr.label}] {disp}"[-80:]
+            if disp != ov_partial_sent[0]:
+                ov_send({"kind": "partial", "text": disp})
+                ov_partial_sent[0] = disp
             if show != partial_shown:
                 pad = max(0, len(partial_shown) - len(show))
                 sys.stdout.write("\r" + show + " " * pad)
@@ -366,6 +406,15 @@ def main():
                     pass
             if refiner_proc.poll() is None:
                 refiner_proc.terminate()
+        if overlay_proc is not None:
+            try:
+                overlay_proc.stdin.close()  # overlay 收到 EOF 自行關閉
+            except OSError:
+                pass
+            try:
+                overlay_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                overlay_proc.terminate()
         print(f"\n--- 結束,產物在 {session} ---")
         for tr in tracks:
             tr.close()
