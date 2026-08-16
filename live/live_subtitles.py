@@ -68,10 +68,10 @@ def load_terms(path: Path):
     return terms
 
 
-def align_final(commit, line):
+def align_final(commit, line, allow_replace=True):
     """final 與已顯示前綴的對齊:回傳 (stable, replace_last, missed_tail)。
     - commit 是 line 的前綴 → 未顯示 suffix 全量原子補上(不限字數,是新字不是回改)
-    - 分歧只在尾端 ≤12 字 → 允許替換該尾端(規格唯一允許的回改範圍)
+    - 分歧只在尾端 ≤12 字 → 允許替換該尾端(僅 final;stall_recover 禁替換,顯示必須單調)
     - 分歧更深 → 用 commit 尾錨在 final 中找續文補尾;找不到才記 missed_tail
     """
     if line.startswith(commit):
@@ -83,7 +83,7 @@ def align_final(commit, line):
         n += 1
     d = len(commit) - n
     # 替換門檻:≤12 字且 ≤ 整段 30%(短句禁止整句改掉)
-    if d <= 12 and d <= max(4, int(0.3 * len(commit))):
+    if allow_replace and d <= 12 and d <= max(4, int(0.3 * len(commit))):
         return line, d, False
     tail_alnum = "".join(ch for ch in commit if ch.isalnum())
     for klen in (8, 6, 4):  # 錨長漸退,提高補尾命中率
@@ -109,6 +109,16 @@ def word_retreat(s, idx):
     while 0 < idx < len(s) and wc(s[idx - 1]) and wc(s[idx]):
         idx -= 1
     return idx
+
+
+def join_pre(pre, s):
+    """把上一句留下的未完成英文 token 接到下一句顯示開頭:
+    ≤3 字元的碎片且下一句小寫開頭才直接黏(ani+me→anime),其餘補空白(gear turn 不誤黏)。"""
+    if not pre or not s:
+        return pre + s
+    if len(pre) <= 3 and s[0].isascii() and s[0].isalpha() and s[0].islower():
+        return pre + s
+    return pre + " " + s
 
 
 def apply_terms(text, terms):
@@ -181,6 +191,10 @@ class Track:
         self.last_loud = 0.0  # 此軌最近一次有聲音的時間(雙音源仲裁用)
         self.recent_finals = []  # [(start_epoch, line)] 近幾句定稿(跨軌 bleed 比對用)
         self.suspect = False  # 本句疑似回授(live 階段即攔,不等 final)
+        self.bar_until = 0.0  # bleed/suspect 後的顯示冷卻期限
+        self.carry = ""  # final 尾端未完成的英文 token,留給同軌下一句銜接(ani+me→anime)
+        self.carry_t = 0.0
+        self.pre = ""  # 本句顯示前綴(承接上一句的 carry)
         self.total = 0  # 累計餵入樣本數(含 keepalive 靜音)
         self.buf = []  # 滾動 PCM 緩衝(mono int16 陣列串),供 2-pass 回切句音訊
         self.buf_start = 0  # buf[0] 開頭對應的樣本位移
@@ -434,9 +448,19 @@ def main():
                     break
         tr.recent_finals.append((tr.utt_start or time.time(), line))
         del tr.recent_finals[:-6]
+        if bleed:
+            tr.bar_until = time.time() + 3.0  # 回音句冷卻:下一句先別上畫面
         if not filler and not bleed:
+            stable_disp = join_pre(tr.pre, stable)
+            # final 尾端未完成的英文 token 暫扣,留給同軌下一句銜接(不靜默丟,紀錄完整)
+            # 詞首必須是小寫字母才像被切斷(OpenAI 這種專名不扣);錨定詞首避免從單字中間切
+            m = _re.search(r"(?<![A-Za-z'\-])[a-z][A-Za-z'\-]{0,11}$", stable_disp)
+            if m and m.start() > 0 and not stable_disp[:m.start()].rstrip().endswith(tuple("，。？！,.?!")):
+                tr.carry = stable_disp[m.start():]
+                tr.carry_t = time.time()
+                stable_disp = stable_disp[:m.start()].rstrip()
             ov_send({"kind": "final", "seq": seq, "utt": tr.utt_id,
-                     "text": stable, "replace_last": rep})
+                     "text": stable_disp, "replace_last": rep})
         else:
             ov_send({"kind": "retract", "utt": tr.utt_id})  # 丟棄句要收回畫面上的進行中行
         rlog({"ev": "final", "utt": tr.utt_id, "seq": seq, "track": tr.name,
@@ -505,6 +529,9 @@ def main():
                     tr.la_advance_t = tr.utt_start
                     tr.ov_rep = 0
                     tr.suspect = False
+                    # 承接上一句尾端未完成的英文 token(2.5s 內才算連續)
+                    tr.pre = tr.carry if (tr.carry and tr.utt_start - tr.carry_t < 2.5) else ""
+                    tr.carry = ""
                 if rec.is_endpoint(tr.stream_s):
                     if text.strip():
                         emit(tr, text)
@@ -545,19 +572,18 @@ def main():
                         if cut > len(tr.la_commit):
                             tr.la_commit = full[:cut]
                             tr.la_advance_t = now
-                    # stall watchdog:解碼與已提交前綴分歧 >1.5s(英文常見)→ 用對齊機制保守恢復,
-                    # 否則畫面凍結、final 一次灌入上百字不可讀
+                    # stall watchdog:解碼與已提交前綴分歧 >1.5s(英文常見)→ 錨定「純追加」恢復;
+                    # 禁止替換/縮行(顯示必須單調),錨不到就凍結等 final 收拾
                     elif (tr.la_commit and not full.startswith(tr.la_commit)
                           and now - tr.la_advance_t > 1.5 and len(full) >= 4):
-                        stable, rep, missed = align_final(tr.la_commit, full)
-                        if not missed and stable != tr.la_commit:
+                        stable, _, missed = align_final(tr.la_commit, full, allow_replace=False)
+                        if not missed and len(stable) > len(tr.la_commit):
                             cut = word_retreat(stable, max(0, len(stable) - 12))
-                            if cut > 0:
+                            if cut > len(tr.la_commit):
                                 tr.la_commit = stable[:cut]
-                                tr.ov_rep = rep
                                 tr.la_advance_t = now
                                 rlog({"ev": "stall_recover", "utt": tr.utt_id,
-                                      "track": tr.name, "rep": rep})
+                                      "track": tr.name})
                     tr.la_last = full
                     # 回音提前攔截:mic 進行中文字與 loopback 相似 → 本句標 suspect,不得上畫面
                     if (tr.name == "mic" and not tr.suspect and lb_tr is not None
@@ -568,19 +594,22 @@ def main():
                         nb = "".join(c for c in b if c.isalnum()).lower()
                         if na and nb and difflib.SequenceMatcher(None, na, nb).ratio() > 0.6:
                             tr.suspect = True
+                            tr.bar_until = now + 3.0  # 冷卻:下一句也先別上畫面
                             rlog({"ev": "suspect", "utt": tr.utt_id})
             # 活動心跳:任一軌句子進行中就禁止 overlay 清屏(清除倒數只從 final 起算)
             if any(t2.utt_id is not None for t2 in tracks) and now - last_busy[0] > 1.0:
                 ov_send({"kind": "busy"})
                 last_busy[0] = now
-            # 顯示仲裁:①喇叭出聲期間 mic 多半是回授,不得搶畫面;
-            # ②一句講完前畫面不換軌(所有權),另一軌內容等定稿再以 final 併入
+            # 顯示仲裁:mic 在 loopback 句子進行中一律不寫畫面(內部照常辨識,
+            # final 確認非回音才一次放行);bleed/suspect 後 3s 冷卻。
+            # owner 只在「自己句子結束」或「被判 suspect」時交出——交接點唯一,禁止互搶
             cands = [t2 for t2 in talking
-                     if not t2.suspect
+                     if not t2.suspect and now >= t2.bar_until
                      and not (t2.name == "mic" and lb_tr is not None
-                              and now - lb_tr.last_loud < 0.7)]
+                              and (lb_tr.utt_id is not None
+                                   or now - lb_tr.last_loud < 0.7))]
             owner = display_owner[0]
-            if owner not in cands or owner.utt_id is None:
+            if owner is None or owner.utt_id is None or owner.suspect:
                 owner = min(cands, key=lambda t2: t2.utt_start or now) if cands else None
                 display_owner[0] = owner
             show = ""
@@ -592,7 +621,7 @@ def main():
                 st = (tr.utt_id, tr.la_commit, tail)
                 if st != ov_live_sent[0]:
                     ev = {"kind": "live", "utt": tr.utt_id,
-                          "committed": tr.la_commit, "tail": tail}
+                          "committed": join_pre(tr.pre, tr.la_commit), "tail": tail}
                     if tr.ov_rep:
                         ev["replace_last"] = tr.ov_rep
                         tr.ov_rep = 0
