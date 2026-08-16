@@ -60,6 +60,12 @@ class Overlay:
         self.cur_utt = None
         self.consumed = 0  # 目前句的 committed 已吸收長度
         self.last_update = 0.0
+        # 行釋放佇列:完成行先排隊,依最小停留時間逐行上到 prev 槽——
+        # final 大尾巴因此按行分頁可讀,本地插話的行也不會瞬間被遠端捲走
+        self.line_q = []
+        self.prev_t = 0.0
+        self.eof = False
+        self._closing = False
         self.q = queue.Queue()
         self.dirty = True
 
@@ -94,6 +100,10 @@ class Overlay:
         self.root.after(2000, self._assert_topmost)
 
     # --- 排版核心 ---
+
+    def _push_line(self, text):
+        if text:
+            self.line_q.append(text)
 
     def _append(self, delta):
         """把新提交的文字接到進行中行;過長時整行捲動(捲出的行不再重排)。
@@ -132,7 +142,7 @@ class Overlay:
             while cut < len(self.cur) and (self.cur[cut] in BREAKS
                                            or self.cur[cut] in "的了嗎呢吧啊嘛哦喔耶"):
                 cut += 1
-            self.prev = self.cur[:cut].strip()
+            self._push_line(self.cur[:cut].strip())
             self.cur = self.cur[cut:].lstrip()
 
     def _tick(self):
@@ -145,12 +155,16 @@ class Overlay:
             if kind == "live":
                 if ev.get("utt") != self.cur_utt:
                     if self.cur.strip():  # 換句/換軌必分隔:殘句先換行,絕不直接串接
-                        self.prev = self.cur.strip()
+                        self._push_line(self.cur.strip())
                         self.cur = ""
                     self.tail = ""
                     self.cur_utt = ev.get("utt")
                     self.consumed = 0
                 c = ev.get("committed", "")
+                rep = min(ev.get("replace_last", 0), self.consumed, len(self.cur))
+                if rep:  # stall 恢復的尾端替換(≤12 字且 ≤30%)
+                    self.cur = self.cur[:len(self.cur) - rep]
+                    self.consumed -= rep
                 if len(c) > self.consumed:
                     self._append(c[self.consumed:])
                     self.consumed = len(c)
@@ -168,12 +182,12 @@ class Overlay:
                         self._append(t[base:])
                 elif t:
                     if self.cur.strip():  # 不同句的 final:先分隔再整句上
-                        self.prev = self.cur.strip()
+                        self._push_line(self.cur.strip())
                         self.cur = ""
                     self._append(t)
                 self.tail = ""
                 if self.cur.strip():  # 句子完成即換行:跨句/跨軌內容不會黏在同一行
-                    self.prev = self.cur.strip()
+                    self._push_line(self.cur.strip())
                     self.cur = ""
                 self.cur_utt = None
                 self.consumed = 0
@@ -189,11 +203,21 @@ class Overlay:
                 # 有句子還在錄音/辨識中:重置停留倒數,活動中禁止清屏
                 self.last_update = time.time()
             elif kind == "eof":
-                # 收尾:最後一句至少停留 1.5s 再消失
-                self.root.after(1500, self.root.destroy)
-                return
+                self.eof = True  # 排空行佇列後再收尾
             self.dirty = True
-        if (self.prev or self.cur or self.tail) and time.time() - self.last_update > HOLD:
+        # 行釋放:每行最少停留 1s(積壓 >3 行時加速到 0.45s),final 大尾巴按行分頁可讀
+        if self.line_q:
+            interval = 0.45 if len(self.line_q) > 3 else 1.0
+            if time.time() - self.prev_t >= interval:
+                self.prev = self.line_q.pop(0)
+                self.prev_t = time.time()
+                self.last_update = time.time()
+                self.dirty = True
+        if self.eof and not self.line_q and not self._closing:
+            self._closing = True  # 最後一行至少停留 1.5s 再消失
+            self.root.after(1500, self.root.destroy)
+        if (not self.line_q and (self.prev or self.cur or self.tail)
+                and time.time() - self.last_update > HOLD):
             self.prev = self.cur = self.tail = ""
             self.cur_utt = None
             self.consumed = 0
@@ -214,8 +238,9 @@ class Overlay:
     def _redraw(self):
         self.canvas.delete("all")
         tail = self.tail
-        # 尾端不顯示不完整的英文單字(mic wa → 等 wave 完整再上)
-        m = re.search(r"[A-Za-z]+$", tail)
+        # 尾端不顯示不完整的英文單字(Let' / speak → 等空白或標點確認完整才上;
+        # apostrophe/hyphen 視為單字內部)
+        m = re.search(r"[A-Za-z][A-Za-z'\-]*$", tail)
         if m:
             tail = tail[:m.start()].rstrip()
         cur_line = (self.cur + tail).strip()

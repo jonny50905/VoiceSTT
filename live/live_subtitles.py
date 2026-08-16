@@ -81,8 +81,10 @@ def align_final(commit, line):
         if a != b:
             break
         n += 1
-    if len(commit) - n <= 12:
-        return line, len(commit) - n, False
+    d = len(commit) - n
+    # 替換門檻:≤12 字且 ≤ 整段 30%(短句禁止整句改掉)
+    if d <= 12 and d <= max(4, int(0.3 * len(commit))):
+        return line, d, False
     tail_alnum = "".join(ch for ch in commit if ch.isalnum())
     for klen in (8, 6, 4):  # 錨長漸退,提高補尾命中率
         key = tail_alnum[-klen:]
@@ -98,6 +100,15 @@ def align_final(commit, line):
         if pos is not None and pos < len(line):
             return commit + line[pos:], 0, False
     return commit, 0, True
+
+
+def word_retreat(s, idx):
+    """把切點退到 Latin 詞界之外(apostrophe/hyphen 視為單字內部,Let's/co-op 不拆)。"""
+    def wc(c):
+        return c.isascii() and (c.isalnum() or c in "'-")
+    while 0 < idx < len(s) and wc(s[idx - 1]) and wc(s[idx]):
+        idx -= 1
+    return idx
 
 
 def apply_terms(text, terms):
@@ -165,6 +176,8 @@ class Track:
         self.la_last = ""  # 上次取樣的完整假設
         self.la_commit = ""  # 已提交前綴
         self.la_t = 0.0  # 上次取樣時間
+        self.la_advance_t = 0.0  # 提交上次推進的時間(stall watchdog 用)
+        self.ov_rep = 0  # 待傳給 overlay 的尾端替換字數
         self.last_loud = 0.0  # 此軌最近一次有聲音的時間(雙音源仲裁用)
         self.recent_finals = []  # [(start_epoch, line)] 近幾句定稿(跨軌 bleed 比對用)
         self.suspect = False  # 本句疑似回授(live 階段即攔,不等 final)
@@ -489,6 +502,8 @@ def main():
                     tr.la_last = ""
                     tr.la_commit = ""
                     tr.la_t = tr.utt_start
+                    tr.la_advance_t = tr.utt_start
+                    tr.ov_rep = 0
                     tr.suspect = False
                 if rec.is_endpoint(tr.stream_s):
                     if text.strip():
@@ -516,20 +531,33 @@ def main():
                             if a != b:
                                 break
                             n += 1
-                        cand = full[:n]
-                        # 提交點不落在英文單字中間(避免 mic wa 這種半個單字上畫面)
-                        while (cand and cand[-1].isascii() and cand[-1].isalpha()
-                               and n < len(full) and full[n].isascii() and full[n].isalpha()):
-                            cand = cand[:-1]
-                            n -= 1
+                        # 提交點退到 Latin 詞界(Let's/co-op 不拆)
+                        cand = full[:word_retreat(full, n)]
                         # 孤立單字不單獨提交:一次至少推進 2 字,等下一批一起顯示
                         if len(cand) - len(tr.la_commit) >= 2 and cand.startswith(tr.la_commit):
                             tr.la_commit = cand
+                            tr.la_advance_t = now
                             rlog({"ev": "live_commit", "utt": tr.utt_id, "track": tr.name,
                                   "len": len(cand)})
-                    # 浮動尾端上限 12 字:更早的內容即使未達成共識也強制提交
+                    # 浮動尾端上限 12 字:更早的內容即使未達成共識也強制提交(切點守詞界)
                     if full.startswith(tr.la_commit) and len(full) - len(tr.la_commit) > 12:
-                        tr.la_commit = full[:len(full) - 12]
+                        cut = word_retreat(full, len(full) - 12)
+                        if cut > len(tr.la_commit):
+                            tr.la_commit = full[:cut]
+                            tr.la_advance_t = now
+                    # stall watchdog:解碼與已提交前綴分歧 >1.5s(英文常見)→ 用對齊機制保守恢復,
+                    # 否則畫面凍結、final 一次灌入上百字不可讀
+                    elif (tr.la_commit and not full.startswith(tr.la_commit)
+                          and now - tr.la_advance_t > 1.5 and len(full) >= 4):
+                        stable, rep, missed = align_final(tr.la_commit, full)
+                        if not missed and stable != tr.la_commit:
+                            cut = word_retreat(stable, max(0, len(stable) - 12))
+                            if cut > 0:
+                                tr.la_commit = stable[:cut]
+                                tr.ov_rep = rep
+                                tr.la_advance_t = now
+                                rlog({"ev": "stall_recover", "utt": tr.utt_id,
+                                      "track": tr.name, "rep": rep})
                     tr.la_last = full
                     # 回音提前攔截:mic 進行中文字與 loopback 相似 → 本句標 suspect,不得上畫面
                     if (tr.name == "mic" and not tr.suspect and lb_tr is not None
@@ -563,8 +591,12 @@ def main():
                 show = f"… [{tr.label}] {tr.la_commit + tail}"[-80:]
                 st = (tr.utt_id, tr.la_commit, tail)
                 if st != ov_live_sent[0]:
-                    ov_send({"kind": "live", "utt": tr.utt_id,
-                             "committed": tr.la_commit, "tail": tail})
+                    ev = {"kind": "live", "utt": tr.utt_id,
+                          "committed": tr.la_commit, "tail": tail}
+                    if tr.ov_rep:
+                        ev["replace_last"] = tr.ov_rep
+                        tr.ov_rep = 0
+                    ov_send(ev)
                     ov_live_sent[0] = st
             if show != partial_shown:
                 pad = max(0, len(partial_shown) - len(show))
